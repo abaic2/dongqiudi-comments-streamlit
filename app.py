@@ -6,7 +6,8 @@
 界面模拟懂球帝新闻列表，用户直接点选新闻即可爬取评论，并额外生成
 「评论词云」与「情感分析」。
 
-  - 顶部加载懂球帝新闻列表（无网络时自动回退内置示例新闻）。
+  - 顶部加载懂球帝**实时**新闻列表（移动端 feed 接口 + 首页 HTML 兜底，
+    全部失败才回退内置示例新闻）。
   - 直接点选新闻卡片 → 抓取该篇评论（优先网页版接口，失败回退 App 接口）。
   - 无外网 / 接口变更导致抓取失败时，自动回退到内置示例评论并显示提示横幅。
   - 词云：对评论内容做中文分词统计，按词频渲染标签云（无需额外字体）。
@@ -15,10 +16,6 @@
 本地运行：
   pip install -r requirements.txt
   streamlit run app.py            # 默认 http://localhost:8501/
-
-说明：
-  Streamlit 没有“路由”概念——爬虫逻辑和界面运行在同一个进程里，
-  点按钮时脚本重跑并直接调用 crawl_article()，因此不存在“前端找不到后端”的问题。
 """
 import os
 import re
@@ -125,56 +122,165 @@ NEG_WORDS = set(
 
 
 # ------------------------- 新闻列表获取（点选爬取） -------------------------
+def _http_get_json(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
+        return json.loads(r.read().decode("utf-8", "ignore"))
+
+
+def _http_get_text(url, headers):
+    req = urllib.request.Request(url, headers=headers)
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
+        return r.read().decode("utf-8", "ignore")
+
+
 def fetch_news_list():
-    """尝试从懂球帝接口获取新闻列表；失败则回退内置示例新闻。"""
+    """获取懂球帝实时新闻列表；失败则回退内置示例新闻。"""
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
+            "(KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
         ),
-        "Referer": "https://www.dongqiudi.com/",
+        "Referer": "https://m.dongqiudi.com/",
+        "Accept": "application/json, text/plain, */*",
     }
-    urls = [
-        "https://www.dongqiudi.com/api/app/tab/2?action=1&type=body&version=500&plat=web",
-        "https://api.dongqiudi.com/app/tab/recommend.json?action=1&version=500&plat=web",
+    # 1) 移动端 feed 接口（多个候选，解析多种字段布局）
+    api_candidates = [
+        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=615&plat=ios",
+        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=615&plat=android",
+        "https://api.dongqiudi.com/api/article/list?category=news&type=first_page&platform=android&version=615",
+        "https://api.dongqiudi.com/api/category/list?platform=android&version=615",
     ]
-    for u in urls:
+    for u in api_candidates:
         try:
-            req = urllib.request.Request(u, headers=headers)
-            ctx = ssl.create_default_context()
-            with urllib.request.urlopen(req, timeout=10, context=ctx) as r:
-                data = json.loads(r.read().decode("utf-8", "ignore"))
+            data = _http_get_json(u, headers)
             arts = parse_articles(data)
             if arts:
                 return arts
         except Exception:  # noqa: BLE001
             continue
+
+    # 2) 首页 HTML 解析兜底（静态 HTML 可能含文章卡片）
+    try:
+        html = _http_get_text("https://www.dongqiudi.com/", headers)
+        arts = parse_homepage(html)
+        if arts:
+            return arts
+    except Exception:  # noqa: BLE001
+        pass
+
     return SAMPLE_NEWS
 
 
+def _pick(d, *keys):
+    for k in keys:
+        if k in d and d[k] not in (None, ""):
+            return d[k]
+    return None
+
+
 def parse_articles(data):
-    items = []
-    d = data.get("data") if isinstance(data, dict) else data
-    if isinstance(d, dict):
-        for k in ("article_list", "list", "items", "articles", "feed"):
-            if isinstance(d.get(k), list):
-                d = d[k]
-                break
-    if isinstance(d, list):
-        items = d
+    """从多种 JSON 布局中抽取文章列表。"""
     out = []
-    for it in items[:30]:
+    d = data.get("data") if isinstance(data, dict) else data
+    # 逐层寻找数组
+    arr = None
+    if isinstance(d, dict):
+        for k in ("item_list", "article_list", "list", "items", "articles", "feed", "results", "rows"):
+            if isinstance(d.get(k), list):
+                arr = d[k]
+                break
+        if arr is None:
+            # 某些接口把数组放在 data 直接是列表
+            for v in d.values():
+                if isinstance(v, list) and v and isinstance(v[0], dict):
+                    arr = v
+                    break
+    elif isinstance(d, list):
+        arr = d
+    if not arr:
+        return []
+    seen = set()
+    for it in arr[:40]:
         if not isinstance(it, dict):
             continue
-        aid = str(it.get("article_id") or it.get("id") or "")
-        title = it.get("title") or it.get("title2") or ""
-        if not aid or not title:
+        aid = str(_pick(it, "article_id", "id", "aid", "item_id") or "")
+        title = _pick(it, "title", "title2", "name", "subject") or ""
+        if not aid or not title or aid in seen:
             continue
-        cover = it.get("thumb") or it.get("cover") or it.get("img") or it.get("image") or None
-        t = it.get("published_at") or it.get("time") or it.get("label") or ""
-        out.append({"id": aid, "title": title.strip(),
-                    "cover": cover, "time": str(t), "tag": it.get("label") or ""})
+        seen.add(aid)
+        cover = _pick(it, "thumb", "cover", "img", "image", "pic", "image_url", "thumbnail")
+        if cover and not str(cover).startswith("http"):
+            cover = None
+        raw_time = _pick(it, "published_at", "time", "show_time", "create_time", "date")
+        out.append({
+            "id": aid,
+            "title": str(title).strip(),
+            "cover": cover,
+            "time": fmt_time(raw_time),
+            "tag": str(_pick(it, "label", "tag", "category", "label_name") or ""),
+        })
     return out
+
+
+def parse_homepage(html):
+    """从首页 HTML 中正则抽取 /articles/{id}.html 文章卡片。"""
+    out = []
+    seen = set()
+    # 先尝试抓嵌入的 JSON（如 window.__INITIAL_STATE__ 或 article_id 出现的对象）
+    for m in re.finditer(r'"/articles/(\d+)\.html"', html):
+        aid = m.group(1)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        # 往后 400 字符内找标题（title 属性或链接文本或 alt）
+        window = html[m.start(): m.start() + 600]
+        title = ""
+        tm = re.search(r'title="([^"]{4,60})"', window)
+        if tm:
+            title = tm.group(1)
+        if not title:
+            tm = re.search(r'alt="([^"]{4,60})"', window)
+            if tm:
+                title = tm.group(1)
+        if not title:
+            tm = re.search(r'class="[^"]*title[^"]*">([^<]{4,60})<', window)
+            if tm:
+                title = tm.group(1)
+        # 往前 400 找封面
+        back = html[max(0, m.start() - 400): m.start()]
+        cm = re.search(r'(https?://[^"\'>\s]+\.(?:jpg|jpeg|png|webp))', back)
+        cover = cm.group(1) if cm else None
+        if not title:
+            title = f"懂球帝文章 #{aid}"
+        out.append({"id": aid, "title": title.strip(), "cover": cover, "time": "", "tag": ""})
+        if len(out) >= 30:
+            break
+    # 去重后再按出现顺序保留
+    uniq = {}
+    for o in out:
+        uniq.setdefault(o["id"], o)
+    return list(uniq.values())
+
+
+def fmt_time(raw):
+    if raw in (None, ""):
+        return ""
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        try:
+            dt = datetime.fromtimestamp(raw / 1000) if raw > 1e11 else datetime.fromtimestamp(raw)
+            return dt.strftime("%m-%d %H:%M")
+        except Exception:
+            return ""
+    s = str(raw).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).strftime("%m-%d %H:%M")
+        except Exception:
+            continue
+    return s[:16]
 
 
 # ------------------------- 纯函数：数据处理（可单测） ------------------------
@@ -313,61 +419,122 @@ def fetch_or_sample(article_id):
     return r, False
 
 
+# ------------------------- 小型 HTML 渲染辅助 -------------------------
+def esc(s):
+    return (str(s).replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+            .replace('"', "&quot;"))
+
+
+def render_hero():
+    return """
+    <div class="dqd-hero">
+      <div class="logo">⚽</div>
+      <div>
+        <h1>懂球帝 · 新闻评论爬取 Demo</h1>
+        <p>像懂球帝一样浏览实时新闻，点选新闻即可爬取评论，并自动生成词云与情感分析</p>
+      </div>
+    </div>
+    """
+
+
+def render_stat_tiles(stats):
+    tiles = ""
+    for v, k, cls in stats:
+        tiles += f'<div class="dqd-stat {cls}"><div class="v">{esc(v)}</div><div class="k">{esc(k)}</div></div>'
+    return f'<div class="dqd-stats">{tiles}</div>'
+
+
+def render_sentiment_bar(pos, neu, neg, total):
+    if total <= 0:
+        return '<p style="color:#888">暂无可分析文本</p>'
+    pp = pos / total * 100
+    np_ = neu / total * 100
+    ng = neg / total * 100
+    return f"""
+    <div class="dqd-sent">
+      <div style="width:{pp:.1f}%;background:#16a34a">{pp:.0f}%</div>
+      <div style="width:{np_:.1f}%;background:#9ca3af">{np_:.0f}%</div>
+      <div style="width:{ng:.1f}%;background:#dc2626">{ng:.0f}%</div>
+    </div>
+    <div style="display:flex;justify-content:space-between;font-size:12px;color:#6b7280">
+      <span>😊 正面 {pos}</span><span>😐 中性 {neu}</span><span>😟 负面 {neg}</span>
+    </div>
+    """
+
+
+def render_emoji_bars(agg, top=10):
+    if not agg:
+        return '<p style="color:#888">无表情表态数据</p>'
+    series = sorted(agg.items(), key=lambda x: -x[1])[:top]
+    mx = max(c for _, c in series)
+    rows = ""
+    for k, c in series:
+        pct = c / mx * 100
+        rows += f"""
+        <div class="dqd-ebar">
+          <div class="lab">{esc(k)} <span style="color:#9ca3af">· {c}</span></div>
+          <div class="track"><div class="fill" style="width:{pct:.0f}%"></div></div>
+        </div>"""
+    return rows
+
+
+def render_hot(comments, topn=8):
+    if not comments:
+        return '<p style="color:#888">暂无评论</p>'
+    rows = build_rows(comments)
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return '<p style="color:#888">暂无评论</p>'
+    df["点赞"] = pd.to_numeric(df["点赞"], errors="coerce").fillna(0).astype(int)
+    hot = df.sort_values("点赞", ascending=False).head(topn)
+    html = ""
+    for _, r in hot.iterrows():
+        meta = (f"👤 {esc(r['用户名'])}　👍 {r['点赞']}　💬 {r['回复数']}　"
+                f"🕒 {esc(r['时间'])}　💡 {esc(r['情感'])}")
+        if r["表情表态"]:
+            meta += f"　{esc(r['表情表态'])}"
+        html += f"""
+        <div class="dqd-hot">
+          <div class="c">{esc(r['评论内容'])}</div>
+          <div class="m">{meta}</div>
+        </div>"""
+    return html
+
+
 # ------------------------- UI（仅在 streamlit 运行时执行） -------------------
 def main():
     st.set_page_config(page_title="懂球帝评论爬取 Demo", page_icon="⚽", layout="wide")
-    st.markdown(
-        """
-        <style>
-        .dqd-bar{padding:10px 16px;background:linear-gradient(135deg,#d51d2a,#ff6a3d);
-            color:#fff;border-radius:10px;font-size:20px;font-weight:700;margin-bottom:12px;}
-        .dqd-card-title{font-weight:600;font-size:15px;line-height:1.35;min-height:42px;}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.markdown('<div class="dqd-bar">⚽ 懂球帝 · 新闻评论爬取 Demo</div>', unsafe_allow_html=True)
-    st.caption(
-        "像懂球帝一样浏览新闻列表，直接点选新闻即可爬取评论，并自动生成词云与情感分析。"
-        "联网将抓取真实数据；无外网或接口变更时自动回退示例数据，保证界面始终可演示。"
-    )
+    st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(render_hero(), unsafe_allow_html=True)
 
     # ---- session state ----
-    if "news" not in st.session_state:
-        st.session_state.news = None
-    if "selected" not in st.session_state:
-        st.session_state.selected = None
-    if "sel_title" not in st.session_state:
-        st.session_state.sel_title = ""
-    if "results" not in st.session_state:
-        st.session_state.results = {}
+    for key in ("news", "selected", "sel_title", "results"):
+        if key not in st.session_state:
+            st.session_state[key] = (None if key in ("news", "selected") else
+                                     ("" if key == "sel_title" else {}))
 
-    # ---- 加载新闻列表 ----
-    col_refresh, col_tip = st.columns([1, 3])
+    # ---- 加载新闻列表（首次自动拉取真实新闻） ----
+    if st.session_state.news is None:
+        with st.spinner("正在获取懂球帝实时新闻…"):
+            st.session_state.news = fetch_news_list()
+
+    col_refresh, _ = st.columns([1, 3])
     with col_refresh:
-        if st.button("🔄 加载 / 刷新新闻列表", use_container_width=True, type="primary"):
-            with st.spinner("正在获取懂球帝新闻列表…"):
+        if st.button("🔄 刷新实时新闻", use_container_width=True, type="primary"):
+            with st.spinner("正在重新获取懂球帝实时新闻…"):
                 st.session_state.news = fetch_news_list()
                 st.session_state.selected = None
                 st.session_state.results = {}
-
-    if st.session_state.news is None:
-        st.info("👆 点击「加载 / 刷新新闻列表」开始（无网络时自动使用内置示例新闻）。")
-        # 也保留手动输入入口
-        with st.expander("或手动输入文章 ID / 链接"):
-            manual = st.text_input("文章链接或数字 ID", placeholder="6358712 或 articles/6358712.html")
-            if st.button("爬取该文章"):
-                ids = dqd.extract_ids_from_args([manual]) if manual.strip() else []
-                if ids:
-                    st.session_state.selected = ids[0]
-        st.stop()
+                st.rerun()
 
     news = st.session_state.news
     is_demo_news = (news is SAMPLE_NEWS)
     if is_demo_news:
         st.warning("⚠️ 当前为内置示例新闻（未能联网获取实时列表），评论数据也会是演示数据。", icon="⚠️")
+    else:
+        st.success("✅ 已加载懂球帝实时新闻列表，直接点选卡片即可爬取评论。", icon="✅")
 
-    st.markdown("### 📰 选择一篇新闻，点击「爬取评论」")
+    st.markdown('<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论</div>', unsafe_allow_html=True)
     cols = st.columns(3)
     for i, art in enumerate(news):
         with cols[i % 3]:
@@ -376,17 +543,12 @@ def main():
                     try:
                         st.image(art["cover"], use_column_width=True)
                     except Exception:  # noqa: BLE001
-                        pass
+                        st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
                 else:
-                    st.markdown(
-                        '<div style="height:96px;background:linear-gradient(135deg,#d51d2a,#ff6a3d);'
-                        'border-radius:8px;display:flex;align-items:center;justify-content:center;'
-                        'color:#fff;font-size:34px">⚽</div>',
-                        unsafe_allow_html=True,
-                    )
-                st.markdown(f'<div class="dqd-card-title">{art["title"]}</div>', unsafe_allow_html=True)
+                    st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
+                st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>', unsafe_allow_html=True)
                 meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
-                st.caption(meta)
+                st.caption(meta or "懂球帝")
                 if st.button("📥 爬取评论", key=f"btn_{art['id']}", use_container_width=True):
                     st.session_state.selected = art["id"]
                     st.session_state.sel_title = art["title"]
@@ -396,8 +558,8 @@ def main():
     if not sel:
         st.stop()
 
-    st.divider()
-    st.markdown(f"## 📰 {st.session_state.get('sel_title', '')}")
+    st.markdown(f'<div class="dqd-sel-title">📰 {esc(st.session_state.get("sel_title", ""))}</div>',
+                unsafe_allow_html=True)
 
     if sel not in st.session_state.results:
         with st.spinner("正在爬取评论（网页版 → App 接口 → 示例兜底）…"):
@@ -417,79 +579,140 @@ def main():
     total = res["total"]
 
     # ---- 概览指标 ----
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("评论总数", total)
-    c2.metric("数据来源", SOURCE_LABEL.get(source, source))
     times = [t for t in (parse_time(c.get("created_at")) for c in comments) if t]
-    if times:
-        c3.metric("最早评论", min(times).strftime("%m-%d %H:%M"))
-        c4.metric("最新评论", max(times).strftime("%m-%d %H:%M"))
-    else:
-        c3.metric("最早评论", "—")
-        c4.metric("最新评论", "—")
+    earliest = min(times).strftime("%m-%d %H:%M") if times else "—"
+    latest = max(times).strftime("%m-%d %H:%M") if times else "—"
+    st.markdown(render_stat_tiles([
+        (total, "评论总数", "red"),
+        (SOURCE_LABEL.get(source, source), "数据来源", ""),
+        (earliest, "最早评论", ""),
+        (latest, "最新评论", ""),
+    ]), unsafe_allow_html=True)
 
     # ---- 词云 ----
-    st.subheader("☁️ 评论词云")
+    st.markdown('<div class="dqd-panel"><h3>☁️ 评论词云</h3>', unsafe_allow_html=True)
     top = build_word_freq(comments)
     st.markdown(render_wordcloud(top), unsafe_allow_html=True)
-    if HAVE_JIEBA:
-        st.caption("（基于 jieba 中文分词统计词频，按频率渲染字号）")
-    else:
-        st.caption("（未安装 jieba，已用正则提取中文词；pip install jieba 可获得更准的分词）")
+    note = ("（基于 jieba 中文分词统计词频，按频率渲染字号）" if HAVE_JIEBA
+            else "（未安装 jieba，已用正则提取中文词；pip install jieba 可获得更准的分词）")
+    st.caption(note)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ---- 情感分析 ----
-    st.subheader("💡 情感分析")
+    st.markdown('<div class="dqd-panel"><h3>💡 情感分析</h3>', unsafe_allow_html=True)
     scored = [sentiment_score(c.get("content", "")) for c in comments]
     if scored:
         avg = sum(scored) / len(scored)
         pos = sum(1 for s in scored if s >= 0.6)
         neg = sum(1 for s in scored if s <= 0.4)
         neu = len(scored) - pos - neg
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("平均情感分", f"{avg:.2f}")
-        s2.metric("正面", f"{pos}（{pos / len(scored) * 100:.0f}%）")
-        s3.metric("中性", f"{neu}（{neu / len(scored) * 100:.0f}%）")
-        s4.metric("负面", f"{neg}（{neg / len(scored) * 100:.0f}%）")
-        sdf = pd.DataFrame({"情感": ["正面", "中性", "负面"], "数量": [pos, neu, neg]})
-        st.bar_chart(sdf.set_index("情感"))
+        st.markdown(render_stat_tiles([
+            (f"{avg:.2f}", "平均情感分", ""),
+            (f"{pos}（{pos / len(scored) * 100:.0f}%）", "正面", ""),
+            (f"{neu}（{neu / len(scored) * 100:.0f}%）", "中性", ""),
+            (f"{neg}（{neg / len(scored) * 100:.0f}%）", "负面", ""),
+        ]), unsafe_allow_html=True)
+        st.markdown(render_sentiment_bar(pos, neu, neg, len(scored)), unsafe_allow_html=True)
         label = ("整体偏正面 😊" if avg >= 0.6 else
                  "整体偏负面 😟" if avg <= 0.4 else "整体中性 😐")
         st.success(f"情感倾向：{label}（情感分基于{'SnowNLP' if HAVE_SNOWNLP else '内置词典'}的启发式估计，仅供参考）")
     else:
         st.caption("没有可供分析的评论文本。")
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ---- 表情 / 表态 Top ----
     agg = aggregate_emoji(comments)
-    if agg:
-        st.subheader("🔥 表情 / 表态 Top 10")
-        series = pd.Series(agg).sort_values(ascending=False).head(10)
-        st.bar_chart(series)
+    st.markdown('<div class="dqd-panel"><h3>🔥 表情 / 表态 Top 10</h3>', unsafe_allow_html=True)
+    st.markdown(render_emoji_bars(agg, 10), unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
-    # ---- 热门评论卡片 ----
-    rows = build_rows(comments)
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df["点赞"] = pd.to_numeric(df["点赞"], errors="coerce").fillna(0).astype(int)
-        hot = df.sort_values("点赞", ascending=False).head(8)
-        st.subheader("💬 热门评论（按点赞排序）")
-        for _, row in hot.iterrows():
-            meta = f"👤 {row['用户名']}　👍 {row['点赞']}　💬 {row['回复数']}　🕒 {row['时间']}　💡 {row['情感']}"
-            if row["表情表态"]:
-                meta += f"　{row['表情表态']}"
-            st.markdown(f"> {row['评论内容']}\n\n_{meta}_")
+    # ---- 热门评论 ----
+    st.markdown('<div class="dqd-panel"><h3>💬 热门评论（按点赞排序）</h3>', unsafe_allow_html=True)
+    st.markdown(render_hot(comments, 8), unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
 
     # ---- 全部评论表格 + 下载 ----
-    st.subheader("📋 全部评论")
+    st.markdown('<div class="dqd-panel"><h3>📋 全部评论</h3>', unsafe_allow_html=True)
+    rows = build_rows(comments)
+    df = pd.DataFrame(rows)
     max_items = st.slider("列表展示条数", 10, 300, 60, key="maxitems")
-    st.dataframe(df.head(max_items), use_container_width=True, height=420)
-    csv = df.to_csv(index=False).encode("utf-8-sig")
-    st.download_button(
-        "⬇️ 下载 CSV",
-        csv,
-        file_name=f"dongqiudi_{res['article_id']}.csv",
-        mime="text/csv",
-    )
+    if not df.empty:
+        st.dataframe(df.head(max_items), use_container_width=True, height=420)
+        csv = df.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "⬇️ 下载 CSV",
+            csv,
+            file_name=f"dongqiudi_{res['article_id']}.csv",
+            mime="text/csv",
+        )
+    st.markdown("</div>", unsafe_allow_html=True)
 
+
+PLACEHOLDER_COVER = (
+    '<div style="height:120px;background:linear-gradient(135deg,#d51d2a,#ff6a3d);'
+    'border-radius:8px;display:flex;align-items:center;justify-content:center;'
+    'color:#fff;font-size:42px">⚽</div>'
+)
+
+CSS = """
+<style>
+:root{
+  --dqd-red:#d51d2a; --dqd-red2:#ff5a3c; --ink:#1b1f24; --muted:#6b7280;
+  --bg:#f5f6f8; --card:#ffffff; --line:#eceef1;
+}
+html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
+.block-container{padding-top:1.1rem!important;padding-left:1.4rem!important;padding-right:1.4rem!important;}
+/* hero */
+.dqd-hero{
+  background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2));
+  border-radius:16px;padding:20px 24px;color:#fff;
+  box-shadow:0 10px 30px rgba(213,29,42,.25);margin-bottom:16px;
+  display:flex;align-items:center;gap:16px;
+}
+.dqd-hero .logo{font-size:40px;line-height:1;}
+.dqd-hero h1{margin:0;font-size:23px;font-weight:800;letter-spacing:.5px;}
+.dqd-hero p{margin:5px 0 0;opacity:.92;font-size:13px;}
+/* section title */
+.dqd-section-title{font-size:17px;font-weight:800;color:var(--ink);
+  margin:18px 0 10px;padding-left:10px;border-left:4px solid var(--dqd-red);}
+/* news container cards */
+.stContainer{border-radius:14px!important;transition:transform .15s ease, box-shadow .15s ease;}
+.stContainer:hover{transform:translateY(-4px);box-shadow:0 12px 28px rgba(0,0,0,.12)!important;}
+.dqd-title{font-weight:700;font-size:15px;line-height:1.4;color:var(--ink);min-height:42px;margin-top:6px;}
+/* selected title */
+.dqd-sel-title{font-size:20px;font-weight:800;color:var(--ink);
+  margin:22px 0 12px;padding:12px 16px;background:var(--card);border:1px solid var(--line);
+  border-left:5px solid var(--dqd-red);border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,.05);}
+/* stat tiles */
+.dqd-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:12px 0;}
+.dqd-stat{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:14px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.03);}
+.dqd-stat .v{font-size:22px;font-weight:800;color:var(--ink);}
+.dqd-stat .k{font-size:12px;color:var(--muted);margin-top:2px;}
+.dqd-stat.red .v{color:var(--dqd-red);}
+/* panels */
+.dqd-panel{background:var(--card);border:1px solid var(--line);border-radius:14px;
+  padding:16px 18px;margin-top:14px;box-shadow:0 2px 8px rgba(0,0,0,.03);}
+.dqd-panel h3{margin:0 0 12px;font-size:16px;color:var(--ink);}
+/* sentiment stacked bar */
+.dqd-sent{display:flex;height:28px;border-radius:999px;overflow:hidden;margin:8px 0 6px;}
+.dqd-sent>div{display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:700;}
+/* hot comment */
+.dqd-hot{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--dqd-red);
+  border-radius:10px;padding:11px 14px;margin-bottom:10px;}
+.dqd-hot .c{font-size:14px;color:var(--ink);line-height:1.5;}
+.dqd-hot .m{font-size:12px;color:var(--muted);margin-top:6px;}
+/* emoji bar */
+.dqd-ebar{margin:7px 0;}
+.dqd-ebar .lab{font-size:13px;color:var(--ink);}
+.dqd-ebar .track{background:#f0f1f3;border-radius:999px;height:14px;overflow:hidden;margin-top:3px;}
+.dqd-ebar .fill{background:linear-gradient(90deg,var(--dqd-red),var(--dqd-red2));height:100%;}
+/* buttons */
+.stButton>button{background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2))!important;
+  color:#fff!important;border:none!important;border-radius:10px!important;font-weight:700!important;}
+.stButton>button:hover{filter:brightness(1.05);}
+</style>
+"""
 
 if __name__ == "__main__":
     main()
