@@ -103,7 +103,7 @@ SAMPLE = {
     ]
 }
 
-SOURCE_LABEL = {"web": "网页版接口", "v2": "App 接口", "sample": "示例数据"}
+SOURCE_LABEL = {"webpage": "懂球帝网页", "web": "网页版接口", "v2": "App 接口", "sample": "示例数据"}
 
 STOPWORDS = set(
     "的 了 是 在 我 你 他 她 它 我们 你们 他们 这 那 这个 那个 也 都 就 还 和 与 及 等 被 把 让 给 "
@@ -414,12 +414,16 @@ def build_rows(comments):
 
 
 def fetch_or_sample(article_id):
-    """抓取某篇文章评论；失败/空则回退示例数据。返回 (result, is_demo)。"""
+    """抓取某篇文章评论；仅当所有来源全部失败才回退示例数据。返回 (result, is_demo)。
+
+    source == "failed" 才视为演示数据；webpage/web/v2（即使是 0 条真实评论）都算真实数据，
+    避免给「没评论的文章」塞假数据。
+    """
     try:
         r = dqd.crawl_article(article_id, max_pages=50)
     except Exception as e:  # noqa: BLE001
         r = {"article_id": article_id, "source": "failed", "total": 0, "comments": [], "error": str(e)}
-    if (not r) or r.get("source") == "failed" or r.get("total", 0) == 0:
+    if (not r) or r.get("source") == "failed":
         return {
             "article_id": article_id, "source": "sample",
             "total": len(SAMPLE["comments"]), "comments": SAMPLE["comments"], "demo": True,
@@ -570,7 +574,7 @@ def main():
                 unsafe_allow_html=True)
 
     if sel not in st.session_state.results:
-        with st.spinner("正在爬取评论（网页版 → App 接口 → 示例兜底）…"):
+        with st.spinner("正在爬取评论（文章页 → 网页接口 → App 接口 → 示例兜底）…"):
             res, demo = fetch_or_sample(sel)
             st.session_state.results[sel] = (res, demo)
     res, demo = st.session_state.results[sel]
@@ -581,6 +585,8 @@ def main():
             "在联网环境运行本应用即可抓取真实评论。",
             icon="⚠️",
         )
+    elif total == 0:
+        st.info("该文章当前没有评论（或评论已关闭），换一篇试试～")
 
     comments = res["comments"]
     source = res["source"]

@@ -53,7 +53,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # ----------------------------- 配置 -----------------------------------------
 
@@ -144,13 +144,157 @@ def _normalize_v2(raw, user_map):
     }
 
 
+# ----------------------------- 文章页评论解析（主来源） -----------------------
+# 懂球帝文章页 www/m.dongqiudi.com/articles/{id}.html 会服务端渲染真实评论，
+# 该域名与新闻首页同域、未被 WAF 拦截，因此在 Streamlit Cloud 等部署环境也能用。
+# 而 api.dongqiudi.com 的评论接口在部分云环境 IP 下会被 403，仅作本地兜底。
+
+ARTICLE_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
+
+
+def _strip_tags(s):
+    """去除 HTML 标签，保留表情图片的 alt 文本。"""
+    if not s:
+        return ""
+    s = re.sub(r'<img[^>]*class="face"[^>]*alt="([^"]*)"[^>]*>', r" \1 ", s)
+    s = re.sub(r"<img[^>]*>", " ", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+
+def _rel_to_dt(s):
+    """把懂球帝的相对时间转成 datetime（转换失败返回 None）。"""
+    s = (s or "").strip()
+    now = datetime.now()
+    if not s:
+        return None
+    m = re.match(r"^(\d+)\s*分钟前$", s)
+    if m:
+        return now - timedelta(minutes=int(m.group(1)))
+    m = re.match(r"^(\d+)\s*小时前$", s)
+    if m:
+        return now - timedelta(hours=int(m.group(1)))
+    m = re.match(r"^(\d+)\s*天前$", s)
+    if m:
+        return now - timedelta(days=int(m.group(1)))
+    if s == "刚刚":
+        return now
+    m = re.match(r"^(今天|昨天)\s*(\d{1,2}):(\d{2})$", s)
+    if m:
+        base = now if m.group(1) == "今天" else now - timedelta(days=1)
+        return base.replace(hour=int(m.group(2)), minute=int(m.group(3)), second=0, microsecond=0)
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _parse_page_comments(html, article_id):
+    """从文章页 HTML 中抽取服务端渲染的评论列表。"""
+    blocks = re.findall(
+        r'<div class="comment-item"[^>]*>(.*?)(?=<div class="comment-item"[^>]*>|\Z)',
+        html, re.S,
+    )
+    total = None
+    m = re.search(r"commentTotal:(\d+)", html)
+    if m:
+        total = int(m.group(1))
+    out = []
+    for i, blk in enumerate(blocks):
+        um = re.search(r'comment-item__user[^>]*>([^<]*)</span>', blk)
+        lm = re.search(r'comment-item__likes[^>]*>([^<]*)</span>', blk)
+        tm = re.search(r'comment-item__time[^>]*>([^<]*)</p>', blk)
+        txm = re.search(r'comment-item__text[^>]*>(.*?)</div>', blk, re.S)
+        user = um.group(1).strip() if um else ""
+        like_txt = re.sub(r"[^0-9]", "", lm.group(1)) if lm else ""
+        like = int(like_txt) if like_txt else 0
+        tstr = tm.group(1).strip() if tm else ""
+        text = _strip_tags(txm.group(1)) if txm else ""
+        if not text and not user:
+            continue
+        if text in ("首页比赛数据 赛事",):
+            continue
+        dt = _rel_to_dt(tstr)
+        out.append({
+            "comment_id": f"{article_id}_{i}",
+            "content": text,
+            "username": user,
+            "user_id": None,
+            "like_count": like,
+            "created_at": dt.strftime("%Y-%m-%d %H:%M:%S") if dt else None,
+            "sub_comment_count": None,
+            "emoji_stats": None,
+            "source": "webpage",
+        })
+    return out, total
+
+
+def crawl_from_article_page(article_id, timeout=20):
+    """从 www/m 文章页抓取并解析真实评论。失败抛异常，0 评论返回 ([], 0)。"""
+    last_err = None
+    html = None
+    for site in ("https://www.dongqiudi.com/articles/", "https://m.dongqiudi.com/articles/"):
+        try:
+            req = urllib.request.Request(site + f"{article_id}.html", headers=ARTICLE_HEADERS)
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                raw = resp.read()
+                if raw[:2] == b"\x1f\x8b":
+                    raw = gzip.decompress(raw)
+                html = raw.decode("utf-8", errors="replace")
+            break
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            continue
+    if html is None:
+        raise RuntimeError(f"article page fetch failed: {last_err}")
+    return _parse_page_comments(html, article_id)
+
+
 def crawl_article(article_id, max_pages=200, request_delay=0.5):
     """
     爬取单篇文章的全部评论。
-    先试网页版，失败回退 v2。返回 dict:
-        {"article_id", "source", "total", "comments": [...]}
+
+    优先级：
+      0) 文章页 www/m.dongqiudi.com/articles/{id}.html（服务端渲染真实评论，
+         与新闻首页同域，通常未被 WAF 拦截，部署环境也可用）→ source="webpage"
+      1) 网页版接口 api.dongqiudi.com/comment/list（带 Referer）→ source="web"
+      2) App 老接口 api.dongqiudi.com/v2/article/{id}/comment → source="v2"
+      全部失败 → source="failed"（调用方据此回退示例数据）
+
+    返回 dict: {"article_id", "source", "total", "comments": [...]}
     """
-    # ---- 尝试网页版 ----
+    # ---- 0) 文章页内嵌真实评论（首选，部署环境通常可用）----
+    try:
+        page_comments, total = crawl_from_article_page(article_id)
+        if page_comments:
+            return {
+                "article_id": str(article_id),
+                "source": "webpage",
+                "total": total or len(page_comments),
+                "comments": page_comments,
+            }
+        if total == 0:
+            # 文章页可访问且确实 0 评论：返回真实空结果，不回退演示
+            return {
+                "article_id": str(article_id),
+                "source": "webpage",
+                "total": 0,
+                "comments": [],
+            }
+    except Exception as e:  # noqa: BLE001
+        print(f"  [文章页评论解析失败: {e}，尝试接口]", file=sys.stderr)
+
+    # ---- 1) 尝试网页版接口 ----
     web_comments = []
     try:
         page = 1
@@ -179,7 +323,7 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
     except Exception as e:  # noqa: BLE001
         print(f"  [网页版接口不可用: {e}，回退 v2 接口]", file=sys.stderr)
 
-    # ---- 回退 v2 接口 ----
+    # ---- 2) 回退 v2 接口 ----
     v2_comments = []
     user_map = {}
     try:
@@ -205,20 +349,23 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
             next_url = nxt
             pages += 1
             time.sleep(request_delay + random.uniform(0, 0.3))
-        return {
-            "article_id": str(article_id),
-            "source": "v2",
-            "total": len(v2_comments),
-            "comments": v2_comments,
-        }
+        if v2_comments:
+            return {
+                "article_id": str(article_id),
+                "source": "v2",
+                "total": len(v2_comments),
+                "comments": v2_comments,
+            }
     except Exception as e:  # noqa: BLE001
         print(f"  [v2 接口也失败: {e}]", file=sys.stderr)
-        return {
-            "article_id": str(article_id),
-            "source": "failed",
-            "total": 0,
-            "comments": [],
-        }
+
+    # ---- 3) 全部失败 ----
+    return {
+        "article_id": str(article_id),
+        "source": "failed",
+        "total": 0,
+        "comments": [],
+    }
 
 
 # ----------------------------- 输出 -----------------------------------------
