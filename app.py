@@ -137,7 +137,14 @@ def _http_get_text(url, headers):
 
 
 def fetch_news_list():
-    """获取懂球帝实时新闻列表；失败则回退内置示例新闻。"""
+    """获取懂球帝实时新闻列表。
+
+    返回 (news_list, is_demo)：
+      - 任一真实接口 / 首页拿到数据 -> (真实列表, False)
+      - 全部失败 -> (内置示例, True)
+
+    用显式 is_demo 标志，避免「把示例说成实时」的误导（旧版横幅就有这个 bug）。
+    """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
@@ -146,10 +153,12 @@ def fetch_news_list():
         "Referer": "https://m.dongqiudi.com/",
         "Accept": "application/json, text/plain, */*",
     }
-    # 1) 移动端 feed 接口（多个候选，解析多种字段布局）
+    real = []
+    # 1) 移动端 feed 接口（多个候选，解析多种布局）
     api_candidates = [
+        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=740&plat=android",
         "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=615&plat=ios",
-        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=615&plat=android",
+        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=880&plat=ios",
         "https://api.dongqiudi.com/api/article/list?category=news&type=first_page&platform=android&version=615",
         "https://api.dongqiudi.com/api/category/list?platform=android&version=615",
     ]
@@ -158,20 +167,31 @@ def fetch_news_list():
             data = _http_get_json(u, headers)
             arts = parse_articles(data)
             if arts:
-                return arts
+                real = arts
+                break
         except Exception:  # noqa: BLE001
             continue
 
-    # 2) 首页 HTML 解析兜底（静态 HTML 可能含文章卡片）
-    try:
-        html = _http_get_text("https://www.dongqiudi.com/", headers)
-        arts = parse_homepage(html)
-        if arts:
-            return arts
-    except Exception:  # noqa: BLE001
-        pass
+    # 2) 首页 HTML 解析兜底（www + m 两个站点都试，提高命中真实新闻的概率）
+    if not real:
+        for site in ("https://www.dongqiudi.com/", "https://m.dongqiudi.com/"):
+            try:
+                html = _http_get_text(site, headers)
+                arts = parse_homepage(html)
+                if arts:
+                    real = arts
+                    break
+            except Exception:  # noqa: BLE001
+                continue
 
-    return SAMPLE_NEWS
+    if real:
+        # 按发布时间倒序，取最新 30 条（无时间字段的排末尾）
+        real.sort(
+            key=lambda a: (parse_time(a.get("raw_time")) or datetime.min),
+            reverse=True,
+        )
+        return real[:30], False
+    return SAMPLE_NEWS, True
 
 
 def _pick(d, *keys):
@@ -220,6 +240,7 @@ def parse_articles(data):
             "title": str(title).strip(),
             "cover": cover,
             "time": fmt_time(raw_time),
+            "raw_time": raw_time,
             "tag": str(_pick(it, "label", "tag", "category", "label_name") or ""),
         })
     return out
@@ -527,8 +548,7 @@ def main():
                 st.session_state.results = {}
                 st.rerun()
 
-    news = st.session_state.news
-    is_demo_news = (news is SAMPLE_NEWS)
+    news, is_demo_news = st.session_state.news
     if is_demo_news:
         st.warning("⚠️ 当前为内置示例新闻（未能联网获取实时列表），评论数据也会是演示数据。", icon="⚠️")
     else:
