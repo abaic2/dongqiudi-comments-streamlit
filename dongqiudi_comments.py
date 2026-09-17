@@ -239,22 +239,36 @@ def _parse_page_comments(html, article_id):
     return out, total
 
 
-def crawl_from_article_page(article_id, timeout=20):
-    """从 www/m 文章页抓取并解析真实评论。失败抛异常，0 评论返回 ([], 0)。"""
+def crawl_from_article_page(article_id, timeout=25, reasons=None):
+    """从 www/m 文章页抓取并解析真实评论。失败抛异常，0 评论返回 ([], 0)。
+
+    reasons: 可选 list，用于收集失败原因（部署环境排查是否被 WAF 拦截时很有用）。
+    """
     last_err = None
     html = None
+    if reasons is None:
+        reasons = []
     for site in ("https://www.dongqiudi.com/articles/", "https://m.dongqiudi.com/articles/"):
-        try:
-            req = urllib.request.Request(site + f"{article_id}.html", headers=ARTICLE_HEADERS)
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                raw = resp.read()
-                if raw[:2] == b"\x1f\x8b":
-                    raw = gzip.decompress(raw)
-                html = raw.decode("utf-8", errors="replace")
+        host = site.split("//")[1].split("/")[0]
+        for attempt in range(1, 3):  # 每个域名重试 2 次
+            try:
+                req = urllib.request.Request(site + f"{article_id}.html", headers=ARTICLE_HEADERS)
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read()
+                    if raw[:2] == b"\x1f\x8b":
+                        raw = gzip.decompress(raw)
+                    html = raw.decode("utf-8", errors="replace")
+                break
+            except Exception as e:  # noqa: BLE001
+                last_err = e
+                code = getattr(e, "code", None)
+                if code:
+                    reasons.append(f"文章页 {host} 第{attempt}次: HTTP {code}")
+                else:
+                    reasons.append(f"文章页 {host} 第{attempt}次: {type(e).__name__}: {e}")
+                time.sleep(1.0 * attempt)
+        if html is not None:
             break
-        except Exception as e:  # noqa: BLE001
-            last_err = e
-            continue
     if html is None:
         raise RuntimeError(f"article page fetch failed: {last_err}")
     return _parse_page_comments(html, article_id)
@@ -273,9 +287,11 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
 
     返回 dict: {"article_id", "source", "total", "comments": [...]}
     """
+    reasons = []
+
     # ---- 0) 文章页内嵌真实评论（首选，部署环境通常可用）----
     try:
-        page_comments, total = crawl_from_article_page(article_id)
+        page_comments, total = crawl_from_article_page(article_id, reasons=reasons)
         if page_comments:
             return {
                 "article_id": str(article_id),
@@ -321,6 +337,7 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
                 "comments": web_comments,
             }
     except Exception as e:  # noqa: BLE001
+        reasons.append(f"网页版接口: {type(e).__name__}: {e}")
         print(f"  [网页版接口不可用: {e}，回退 v2 接口]", file=sys.stderr)
 
     # ---- 2) 回退 v2 接口 ----
@@ -357,6 +374,7 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
                 "comments": v2_comments,
             }
     except Exception as e:  # noqa: BLE001
+        reasons.append(f"App v2 接口: {type(e).__name__}: {e}")
         print(f"  [v2 接口也失败: {e}]", file=sys.stderr)
 
     # ---- 3) 全部失败 ----
@@ -365,6 +383,7 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
         "source": "failed",
         "total": 0,
         "comments": [],
+        "reasons": reasons,
     }
 
 

@@ -422,11 +422,13 @@ def fetch_or_sample(article_id):
     try:
         r = dqd.crawl_article(article_id, max_pages=50)
     except Exception as e:  # noqa: BLE001
-        r = {"article_id": article_id, "source": "failed", "total": 0, "comments": [], "error": str(e)}
+        r = {"article_id": article_id, "source": "failed", "total": 0, "comments": [],
+             "error": str(e), "reasons": [str(e)]}
     if (not r) or r.get("source") == "failed":
         return {
             "article_id": article_id, "source": "sample",
             "total": len(SAMPLE["comments"]), "comments": SAMPLE["comments"], "demo": True,
+            "reasons": r.get("reasons") or [],
         }, True
     r["demo"] = False
     return r, False
@@ -579,18 +581,24 @@ def main():
             st.session_state.results[sel] = (res, demo)
     res, demo = st.session_state.results[sel]
 
-    if demo:
-        st.warning(
-            "⚠️ 当前为**演示数据**：未能抓到真实评论（可能本机无外网或接口已变更）。"
-            "在联网环境运行本应用即可抓取真实评论。",
-            icon="⚠️",
-        )
-    elif total == 0:
-        st.info("该文章当前没有评论（或评论已关闭），换一篇试试～")
-
+    # 注意：必须先赋值再判断，否则 elif 中的 total 未定义会抛 NameError
     comments = res["comments"]
     source = res["source"]
     total = res["total"]
+
+    if demo:
+        st.warning(
+            "⚠️ 当前为**演示数据**：未能抓到真实评论。"
+            "已依次尝试「文章页 → 网页接口 → App 接口」，均失败。",
+            icon="⚠️",
+        )
+        reasons = res.get("reasons") or []
+        if reasons:
+            with st.expander("🔍 查看失败原因（排查用）"):
+                for rr in reasons:
+                    st.code(rr)
+    elif total == 0:
+        st.info("该文章当前没有评论（或评论已关闭），换一篇试试～")
 
     # ---- 概览指标 ----
     times = [t for t in (parse_time(c.get("created_at")) for c in comments) if t]
