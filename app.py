@@ -137,60 +137,32 @@ def _http_get_text(url, headers):
 
 
 def fetch_news_list():
-    """获取懂球帝实时新闻列表。
+    """获取懂球帝实时新闻列表（真实数据源：官网首页 HTML）。
 
     返回 (news_list, is_demo)：
-      - 任一真实接口 / 首页拿到数据 -> (真实列表, False)
-      - 全部失败 -> (内置示例, True)
+      - 官网首页抓到文章 -> (真实列表, False)
+      - 全部失败 -> (内置示例, True)，由调用方显示 ⚠️ 横幅，绝不假装实时。
 
-    用显式 is_demo 标志，避免「把示例说成实时」的误导（旧版横幅就有这个 bug）。
+    重要：之前猜的 api.dongqiudi.com 新闻接口已全部 403（实测确认），
+    官网首页是公开页面、服务端渲染带 /articles/{id}.html 链接，最稳。
     """
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 "
-            "(KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Referer": "https://m.dongqiudi.com/",
-        "Accept": "application/json, text/plain, */*",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "zh-CN,zh;q=0.9",
     }
-    real = []
-    # 1) 移动端 feed 接口（多个候选，解析多种布局）
-    api_candidates = [
-        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=740&plat=android",
-        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=615&plat=ios",
-        "https://api.dongqiudi.com/api/app/tab/2?action=1&type=body&version=880&plat=ios",
-        "https://api.dongqiudi.com/api/article/list?category=news&type=first_page&platform=android&version=615",
-        "https://api.dongqiudi.com/api/category/list?platform=android&version=615",
-    ]
-    for u in api_candidates:
+    # 官网首页（PC + 移动）依次尝试；任一拿到文章即视为真实数据
+    for site in ("https://www.dongqiudi.com/", "https://m.dongqiudi.com/"):
         try:
-            data = _http_get_json(u, headers)
-            arts = parse_articles(data)
+            html = _http_get_text(site, headers)
+            arts = parse_homepage(html)
             if arts:
-                real = arts
-                break
+                return arts[:40], False
         except Exception:  # noqa: BLE001
             continue
-
-    # 2) 首页 HTML 解析兜底（www + m 两个站点都试，提高命中真实新闻的概率）
-    if not real:
-        for site in ("https://www.dongqiudi.com/", "https://m.dongqiudi.com/"):
-            try:
-                html = _http_get_text(site, headers)
-                arts = parse_homepage(html)
-                if arts:
-                    real = arts
-                    break
-            except Exception:  # noqa: BLE001
-                continue
-
-    if real:
-        # 按发布时间倒序，取最新 30 条（无时间字段的排末尾）
-        real.sort(
-            key=lambda a: (parse_time(a.get("raw_time")) or datetime.min),
-            reverse=True,
-        )
-        return real[:30], False
     return SAMPLE_NEWS, True
 
 
@@ -247,43 +219,59 @@ def parse_articles(data):
 
 
 def parse_homepage(html):
-    """从首页 HTML 中正则抽取 /articles/{id}.html 文章卡片。"""
+    """从官网首页 HTML 中稳健抽取 /articles/{id}.html 文章卡片（含标题/封面）。
+
+    策略：优先用 <a href=".../articles/{id}.html">链接文本</a> 抽取（最可靠），
+    链接文本里通常含「分类 标题 时间·评论数」，做必要清洗后保留标题；
+    若锚点匹配失败，再用宽松正则兜底抓文章 ID。
+    """
     out = []
     seen = set()
-    # 先尝试抓嵌入的 JSON（如 window.__INITIAL_STATE__ 或 article_id 出现的对象）
-    for m in re.finditer(r'"/articles/(\d+)\.html"', html):
-        aid = m.group(1)
+    # 1) 锚点链接抽取（兼容单/双引号、相对/绝对 URL）
+    anchor = re.compile(
+        r'<a\b[^>]*?href=["\']([^"\']*?/articles/(\d+)\.html)["\'][^>]*>(.*?)</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    for m in anchor.finditer(html):
+        aid = m.group(2)
         if aid in seen:
             continue
         seen.add(aid)
-        # 往后 400 字符内找标题（title 属性或链接文本或 alt）
-        window = html[m.start(): m.start() + 600]
-        title = ""
-        tm = re.search(r'title="([^"]{4,60})"', window)
-        if tm:
-            title = tm.group(1)
-        if not title:
-            tm = re.search(r'alt="([^"]{4,60})"', window)
-            if tm:
-                title = tm.group(1)
-        if not title:
-            tm = re.search(r'class="[^"]*title[^"]*">([^<]{4,60})<', window)
-            if tm:
-                title = tm.group(1)
-        # 往前 400 找封面
-        back = html[max(0, m.start() - 400): m.start()]
-        cm = re.search(r'(https?://[^"\'>\s]+\.(?:jpg|jpeg|png|webp))', back)
+        inner = m.group(3)
+        # 优先取 class 含 title 的元素文本，否则取整段链接文本
+        tm = re.search(r'class=["\'][^"\']*title[^"\']*["\']>(.*?)</', inner, re.IGNORECASE | re.DOTALL)
+        raw = tm.group(1) if tm else inner
+        text = re.sub(r"<[^>]+>", " ", raw)
+        text = re.sub(r"\s+", " ", text).strip()
+        # 去除尾部/混杂的元数据：日期、评论数、相对时间
+        text = re.sub(r"\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}.*$", "", text).strip()
+        text = re.sub(r".*?·\s*\d+\s*评论.*$", "", text).strip()
+        text = re.sub(r"\d+\s*评\s*.*$", "", text).strip()
+        text = re.sub(r"(刚刚|分钟前|小时前|天前).*$", "", text).strip()
+        if len(text) < 4:
+            text = f"懂球帝文章 #{aid}"
+        # 往前 2000 字符找封面图
+        back = html[max(0, m.start() - 2000):m.start()]
+        cm = re.search(r'<img\b[^>]*?src=["\']([^"\']+\.(?:jpg|jpeg|png|webp))["\']', back, re.IGNORECASE)
         cover = cm.group(1) if cm else None
-        if not title:
-            title = f"懂球帝文章 #{aid}"
-        out.append({"id": aid, "title": title.strip(), "cover": cover, "time": "", "tag": ""})
-        if len(out) >= 30:
+        if cover and cover.startswith("//"):
+            cover = "https:" + cover
+        out.append({"id": aid, "title": text, "cover": cover, "time": "", "tag": "", "raw_time": None})
+        if len(out) >= 40:
             break
-    # 去重后再按出现顺序保留
+    # 2) 兜底：宽松匹配任何 /articles/{id}.html
+    if not out:
+        for m in re.finditer(r'(?:href=["\']?|"/)(?:https?://[^\s"\']*?)?/articles/(\d+)\.html', html):
+            aid = m.group(1)
+            if aid in seen:
+                continue
+            seen.add(aid)
+            out.append({"id": aid, "title": f"懂球帝文章 #{aid}", "cover": None, "time": "", "tag": "", "raw_time": None})
+    # 去重保序
     uniq = {}
     for o in out:
         uniq.setdefault(o["id"], o)
-    return list(uniq.values())
+    return list(uniq.values())[:40]
 
 
 def fmt_time(raw):
