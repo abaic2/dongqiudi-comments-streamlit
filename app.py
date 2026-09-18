@@ -1183,8 +1183,9 @@ def chart_ability_compare(A, B):
 
 
 def chart_ability_rank(items, top=15):
-    """球员能力值（总评）横向柱。items: [{"name","avg"}]。"""
-    d = list(reversed([x for x in items if x.get("avg")][:top]))
+    """球员能力值（总评）横向柱。items: [{"name","avg"}]（内部按能力降序取前 top）。"""
+    rows = sorted([x for x in items if x.get("avg")], key=lambda x: -x["avg"])[:top]
+    d = list(reversed(rows))
     return {
         "grid": {"left": 92, "right": 46, "top": 16, "bottom": 24},
         "tooltip": {"trigger": "axis"},
@@ -1704,8 +1705,10 @@ def page_data():
                     # ---- 以首发 11 人能力值为基础的球队评分 ----
                     try:
                         with st.spinner("正在加载首发 11 人能力值（传球 / 身体 / 射门…）…"):
-                            abA = _cached(f"ab_{mid}_A", DD.fetch_team_ability, A["starters"])
-                            abB = _cached(f"ab_{mid}_B", DD.fetch_team_ability, B["starters"])
+                            abA = _cached(f"ab_{mid}_A", DD.fetch_team_ability,
+                                          A["starters"], A.get("name") or "")
+                            abB = _cached(f"ab_{mid}_B", DD.fetch_team_ability,
+                                          B["starters"], B.get("name") or "")
                     except Exception as e:  # noqa: BLE001
                         st.warning(f"能力值加载失败（其余功能不受影响）：{type(e).__name__}: {e}")
                         abA, abB = {"players": []}, {"players": []}

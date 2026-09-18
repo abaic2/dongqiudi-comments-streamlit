@@ -266,11 +266,29 @@ SPORT_HEADERS = {
 
 
 def sport_team_id(www_team_id):
-    """网页版球队 ID → sport-data 球队 ID（实测规则：前缀 50000）。"""
+    """网页版球队 ID → 可直接用于 sport-data 查询的 ID。
+
+    ⚠️ 实测坑（2026-09-18 修）：**并非**统一加 "50000" 前缀——
+      · 英超 513  →  加前缀 50000513 ✅（原值 513 同样可用）
+      · 西甲 1755 →  加前缀 500001755 ❌ 返回空（原值 1755 才可用）
+      · 意甲 1039 / 中超 76899 → 加前缀同样返回空
+    所以查询一律用**网页版原值**；比赛/阵容里那套内部 ID（50000513 / 50001755）
+    改由 sport_team_id_variants + 赛程响应里的 season_list.url 解析得到。
+    """
+    s = str(www_team_id or "").strip()
+    return s or None
+
+
+def sport_team_id_variants(www_team_id):
+    """同一支球队在 sport-data 里可能出现的各种 ID 写法（用于比对阵容 team_id）。"""
     s = str(www_team_id or "").strip()
     if not s:
-        return None
-    return s if s.startswith("50000") else "50000" + s
+        return []
+    out = [s]
+    if s.isdigit():
+        out.append("5" + s.zfill(7))     # 513 → 50000513, 1755 → 50001755
+        out.append("50000" + s)          # 兼容历史上用过的写法
+    return list(dict.fromkeys(out))
 
 
 def _sget(path, params=None, timeout=20):
@@ -318,29 +336,44 @@ def fetch_sport_ranking(season_id, kind="person", rtype="goals"):
 
 
 def fetch_team_schedule(team_id, season=None):
-    """球队赛程。status=Played 表示已结束（可用于取 match_id 查阵容评分）。"""
+    """球队赛程。status=Played 表示已结束（可用于取 match_id 查阵容评分）。
+
+    入参 `team_id` 用**网页版原值**（513 / 1755 / 76899…，实测在所有联赛都可用）。
+    比赛条目里的 team_A_id/team_B_id 是 sport-data 的内部 ID（50000513 / 50001755…），
+    这里通过 season_list 的 url 解析出本队的内部 ID，放在每条的 `my_id` 上，
+    供上层比对阵容（lineup）里的 team_id。另外 `my_ids` 一次性返回全部可能写法。
+    """
     params = {"season": season} if season else {}
     c = _sget(f"dqd/team/schedule/{team_id}", params)
     if not isinstance(c, dict):
         return []
-    tid = str(team_id)
+    my_ids = set(sport_team_id_variants(team_id))
+    for sl in c.get("season_list") or []:
+        mm = re.search(r"/team/schedule/(\d+)", (sl or {}).get("url") or "")
+        if mm:
+            my_ids.add(mm.group(1))
     out = []
     for m in c.get("data") or []:
         if not isinstance(m, dict) or not m.get("match_id"):
             continue
+        aid = str(m.get("team_A_id") or "")
+        bid = str(m.get("team_B_id") or "")
+        my_id = aid if aid in my_ids else (bid if bid in my_ids else "")
         out.append({
             "match_id": str(m.get("match_id")),
             "competition": m.get("competition_name") or "",
             "gameweek": m.get("gameweek") or m.get("round_name") or "",
             "home": m.get("team_A_name") or "",
             "away": m.get("team_B_name") or "",
-            "home_id": str(m.get("team_A_id") or ""),
-            "away_id": str(m.get("team_B_id") or ""),
+            "home_id": aid,
+            "away_id": bid,
             "score": (f"{m.get('fs_A')}-{m.get('fs_B')}"
                       if m.get("fs_A") not in (None, "") else ""),
             "start_play": m.get("start_play") or "",
             "status": m.get("status") or "",
-            "is_home": str(m.get("team_A_id") or "") == tid,
+            "my_id": my_id,
+            "my_ids": sorted(my_ids),
+            "is_home": aid in my_ids,
         })
     return out
 
@@ -511,13 +544,13 @@ def fetch_players_ability(person_ids, workers=8):
     return out
 
 
-def fetch_team_ability(starters, workers=8):
+def fetch_team_ability(starters, team_name="", workers=8):
     """以首发球员的能力值为基础，算出「球队能力评分」。
 
     球队能力评分 = 首发 11 人能力值（总评）的平均分（与比赛评分口径一致）。
     同时给出球队雷达（非门将 6 维均值）与门将雷达。
 
-    返回 {players:[{id,name,position,shirt,rate,avg,radar,is_gk}],
+    返回 {name, players:[{id,name,position,shirt,rate,avg,radar,is_gk}],
           team_avg, radar:{维度:值}, radar_list:[{name,val}], gk_radar, gk_name,
           covered, total, groups_avg:{组:均值}}
     """
@@ -556,6 +589,7 @@ def fetch_team_ability(starters, workers=8):
             radar_list.append({"name": dim, "val": round(sum(vs) / len(vs))})
     covered = len(avgs)
     return {
+        "name": team_name or "",
         "players": players,
         "team_avg": round(sum(avgs) / len(avgs), 1) if avgs else None,
         "radar": {x["name"]: x["val"] for x in radar_list},
@@ -571,10 +605,21 @@ def fetch_team_ability(starters, workers=8):
 def fetch_team_ratings(team_id, limit=6):
     """抓球队最近 limit 场已结束比赛的阵容，汇总每名球员的场均评分。
 
+    team_id 用**网页版原值**（如 1755=皇马 / 513=阿森纳）；阵容里的 team_id 是
+    sport-data 内部 ID，这里用赛程返回的 my_ids 做兼容比对，避免西甲/意甲/中超
+    因为 ID 空间不同而一场都匹配不上（历史 bug，2026-09-18 修）。
+
     返回 {"matches":[...], "players":[{name,position,matches,avg_rate,best,ratings}],
           "team_avg": float|None}
     """
-    sched = [m for m in fetch_team_schedule(team_id)
+    all_sched = fetch_team_schedule(team_id)
+    my_ids = set(sport_team_id_variants(team_id))
+    for m in all_sched:
+        my_ids.update(str(x) for x in (m.get("my_ids") or []) if x)
+        if m.get("my_id"):
+            my_ids.add(str(m["my_id"]))
+    my_ids.discard("")
+    sched = [m for m in all_sched
              if m.get("status") == "Played" and m["match_id"]]
     sched = list(reversed(sched))[:limit]          # 最近的在前
     matches, agg = [], {}
@@ -586,7 +631,7 @@ def fetch_team_ratings(team_id, limit=6):
         side = None
         for k in ("A", "B"):
             t = lu.get(k)
-            if t and t.get("team_id") == str(team_id):
+            if t and str(t.get("team_id")) in my_ids:
                 side = t
                 break
         if not side:
