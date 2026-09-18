@@ -318,6 +318,50 @@ def fetch_comment_count(article_id):
         return None
 
 
+def parse_related_news(html):
+    """从文章页 HTML 里抽取「相关推荐」relatedNews（含较早的文章）。"""
+    i = html.find("relatedNews:[")
+    if i < 0:
+        return []
+    j = html.find("]", i)
+    if j < 0:
+        return []
+    seg = html[i:j + 1]
+    out = []
+    pat = re.compile(r'\{id:"(\d+)",title:"(.*?)",time:"(.*?)",thumb:"(.*?)"\}', re.S)
+    for m in pat.finditer(seg):
+        aid, title, tstr, thumb = m.groups()
+        cover = thumb.replace("\\u002F", "/").replace("\\/", "/") if thumb else None
+        if not cover or not str(cover).startswith("http"):
+            cover = None
+        out.append({"id": aid, "title": title.strip(), "cover": cover, "time": tstr,
+                    "tag": "", "league": "", "raw_time": tstr, "comments": None})
+    return out
+
+
+def extend_pool_with_related(article_id):
+    """打开一篇文章时，把它页内的「相关推荐」并入新闻池 —— 渐进扩大可搜索范围。"""
+    try:
+        h = dict(FEED_HEADERS)
+        h["Accept"] = "text/html,application/xhtml+xml,*/*;q=0.8"
+        html = _http_get_text(f"https://www.dongqiudi.com/articles/{article_id}.html", h)
+    except Exception:  # noqa: BLE001
+        return 0
+    related = parse_related_news(html)
+    news, is_demo = st.session_state.news
+    seen = {a["id"] for a in news}
+    added = 0
+    for a in related:
+        if a["id"] in seen:
+            continue
+        seen.add(a["id"])
+        news.append(a)
+        added += 1
+    st.session_state.news = (news, is_demo)
+    st.session_state.related_added = added
+    return added
+
+
 def enrich_comment_counts(items):
     """给「评论数未知」的新闻补评论数（并发 + 会话内缓存，通常只补当前页）。"""
     if "cnt_cache" not in st.session_state:
@@ -856,6 +900,15 @@ def main():
         with st.spinner("正在获取懂球帝实时新闻…"):
             st.session_state.news = fetch_news_list()
 
+    # 打开过文章 → 把该文「相关推荐」并入新闻池（提前执行，保证下面的条数一致）
+    _sel_now = st.session_state.get("selected")
+    if _sel_now and st.session_state.get("related_for") != _sel_now:
+        st.session_state.related_for = _sel_now
+        try:
+            extend_pool_with_related(_sel_now)
+        except Exception:  # noqa: BLE001
+            pass
+
     # ---- 工具栏：刷新按钮（左） + 状态提示（右） ----
     c_btn, c_deep, c_status = st.columns([1, 1.15, 3], gap="medium")
     with c_btn:
@@ -903,6 +956,28 @@ def main():
                 unsafe_allow_html=True)
     tag = st.pills("标签", NEWS_TAGS, selection_mode="single", key="tag_pick",
                    label_visibility="collapsed")
+
+    # ---- 搜索范围说明 + 按链接/ID 直接打开（查任意历史文章）----
+    st.caption(f"🔎 搜索与标签只覆盖「当前已加载的 {len(news)} 条新闻」——"
+               f"懂球帝未开放按关键词检索历史的接口（网页搜索页 403、App 搜索接口需签名）。"
+               f"想查更早的文章，可用下面的方式直接打开。")
+    with st.expander("🔗 按链接 / 文章 ID 直接打开（可打开任意历史文章）"):
+        raw_in = st.text_input(
+            "粘贴懂球帝文章链接或 ID", key="direct_input",
+            placeholder="例如 6361288，或 https://www.dongqiudi.com/articles/6361288.html")
+        cgo, ctip = st.columns([1, 3], gap="medium")
+        with cgo:
+            go = st.button("打开并抓取评论", key="direct_go", width="stretch")
+        with ctip:
+            st.caption("文章 ID 就在链接里：/articles/**6361288**.html")
+        if go and (raw_in or "").strip():
+            _ids = dqd.extract_ids_from_args([raw_in.strip()])
+            if _ids:
+                st.session_state.selected = _ids[0]
+                st.session_state.sel_title = f"文章 #{_ids[0]}"
+                st.rerun()
+            else:
+                st.warning("没识别出文章 ID，请检查输入。")
 
     # 关键词 / 标签变化 → 回到第 1 页
     if (st.session_state.last_query != q) or (st.session_state.get("last_tag") != tag):
@@ -994,6 +1069,10 @@ def main():
     # ---- 已选新闻标题 ----
     st.markdown(f'<div class="dqd-sel-title">📰 {esc(st.session_state.get("sel_title", ""))}</div>',
                 unsafe_allow_html=True)
+
+    if st.session_state.get("related_added"):
+        st.caption(f"🔗 已从该文「相关推荐」补充 "
+                   f"{st.session_state.related_added} 条新闻到搜索池。")
 
     if sel not in st.session_state.results:
         with st.spinner("正在爬取评论（App 接口全量翻页 → 网页首屏兜底）…"):
