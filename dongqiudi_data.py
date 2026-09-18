@@ -4,8 +4,19 @@
 懂球帝「数据分析」数据层
 ========================
 
-实测可用的公开数据入口（全部走 www.dongqiudi.com 的服务端渲染页面，
-不依赖需要签名鉴权的 api 搜索接口，因此部署环境同样可用）：
+实测可用的公开数据入口，两类：
+
+【A】sport-data.dongqiudi.com（懂球帝网页版数据页真正在用的 JSON 服务，无需签名）
+      —— 从 /_nuxt/*.js 里挖出来的，是「评分 / 阵容 / 赛程 / 榜单」的来源：
+        · /data/standing?season_id=            积分榜
+        · /data/ranking/person?type=person     球员榜可用类型（42 种指标）
+        · /data/person_ranking?type=goals      球员榜数据
+        · /dqd/team/schedule/{teamId}          球队赛程（含已结束比赛的 match_id）
+        · /dqd/team/sample/{teamId}            球队资料（城市/成立年/球场/身价）
+        · /dqd/v1/match/lineup/{matchId}  ★    比赛阵容：首发 11 人 + 每人 rate 评分
+              → 首发 11 人 rate 的平均分即「球队评分」
+
+【B】www.dongqiudi.com 的服务端渲染页面（JSON 服务不可用时的兜底）：
 
   - 联赛数据页  https://www.dongqiudi.com/data?cid={联赛ID}&tab={standings|team|person}
         · tab=standings  积分榜：# 球队 赛 胜 平 负 进/失 净胜 积分（含球队ID/队徽）
@@ -25,7 +36,9 @@ payload 的 `"4","英超"` 推出。
 """
 
 import gzip
+import json
 import re
+import urllib.parse
 import urllib.request
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -231,3 +244,234 @@ def enrich_standings(rows):
             "胜率": round(r["胜"] / p * 100, 1),
         })
     return out
+
+
+# ============================================================================
+# 评分 / 阵容 / 赛程（sport-data.dongqiudi.com —— 懂球帝网页版数据页的真正数据源）
+# ----------------------------------------------------------------------------
+# 关键发现：比赛阵容接口 /dqd/v1/match/lineup/{matchId} 里，每名球员都带
+# `rate` 字段（如 "7.9"），这就是**球员比赛评分**；lineups 恰好是**首发 11 人**。
+# 因此：球队评分 = 首发 11 人 rate 的平均分。
+# 球队 ID 映射：sport-data 用 "50000" + 网页版(www)球队 ID（www=513 → 50000513 阿森纳）。
+# ============================================================================
+
+SPORT_BASE = "https://sport-data.dongqiudi.com/soccer/biz"
+
+SPORT_HEADERS = {
+    "User-Agent": UA,
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://www.dongqiudi.com/data",
+}
+
+
+def sport_team_id(www_team_id):
+    """网页版球队 ID → sport-data 球队 ID（实测规则：前缀 50000）。"""
+    s = str(www_team_id or "").strip()
+    if not s:
+        return None
+    return s if s.startswith("50000") else "50000" + s
+
+
+def _sget(path, params=None, timeout=20):
+    """请求 sport-data 接口，自动解包 {template, content} 信封（content 可能是 JSON 字符串）。"""
+    q = {"app": "dqd", "version": "853", "platform": "ios", "language": "zh-cn"}
+    q.update(params or {})
+    url = f"{SPORT_BASE}/{path}?{urllib.parse.urlencode(q)}"
+    req = urllib.request.Request(url, headers=SPORT_HEADERS)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        d = json.loads(raw.decode("utf-8", "ignore"))
+    c = d.get("content", d)
+    if isinstance(c, str):
+        try:
+            c = json.loads(c)
+        except Exception:  # noqa: BLE001
+            pass
+    return c
+
+
+def _rate(v):
+    try:
+        f = float(v)
+        return f if f > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_ranking_types(kind="person"):
+    """榜单可用类型列表。kind: person / team。返回 [{"name","type"}...]"""
+    c = _sget(f"data/ranking/{kind}", {"season_id": 27502, "type": kind})
+    rows = c.get("data") if isinstance(c, dict) else c
+    return [{"name": r.get("name"), "type": r.get("type")}
+            for r in (rows or []) if isinstance(r, dict)]
+
+
+def fetch_sport_ranking(season_id, kind="person", rtype="goals"):
+    """sport-data 榜单数据（kind=person/team）。"""
+    path = "data/person_ranking" if kind == "person" else "data/team_ranking"
+    c = _sget(path, {"season_id": season_id, "type": rtype})
+    rows = c.get("data") if isinstance(c, dict) else c
+    return rows or []
+
+
+def fetch_team_schedule(team_id, season=None):
+    """球队赛程。status=Played 表示已结束（可用于取 match_id 查阵容评分）。"""
+    params = {"season": season} if season else {}
+    c = _sget(f"dqd/team/schedule/{team_id}", params)
+    if not isinstance(c, dict):
+        return []
+    tid = str(team_id)
+    out = []
+    for m in c.get("data") or []:
+        if not isinstance(m, dict) or not m.get("match_id"):
+            continue
+        out.append({
+            "match_id": str(m.get("match_id")),
+            "competition": m.get("competition_name") or "",
+            "gameweek": m.get("gameweek") or m.get("round_name") or "",
+            "home": m.get("team_A_name") or "",
+            "away": m.get("team_B_name") or "",
+            "home_id": str(m.get("team_A_id") or ""),
+            "away_id": str(m.get("team_B_id") or ""),
+            "score": (f"{m.get('fs_A')}-{m.get('fs_B')}"
+                      if m.get("fs_A") not in (None, "") else ""),
+            "start_play": m.get("start_play") or "",
+            "status": m.get("status") or "",
+            "is_home": str(m.get("team_A_id") or "") == tid,
+        })
+    return out
+
+
+def _parse_player(p):
+    """规整单个球员（含 rate 评分与单场 stats）。"""
+    st = p.get("statistics") or {}
+    stats = {}
+    if isinstance(st, dict):
+        for kv in st.get("keys") or []:
+            if isinstance(kv, dict) and kv.get("type"):
+                stats[kv["type"]] = kv.get("data")
+    return {
+        "id": p.get("person_id"),
+        "name": p.get("person") or "",
+        "shirt": p.get("shirtnumber") or "",
+        "position": p.get("position") or "",
+        "rate": _rate(p.get("rate")),
+        "captain": bool(p.get("captain")),
+        "mvp": bool(p.get("is_mvp")),
+        "nationality": p.get("nationality_name") or "",
+        "events": p.get("events") or [],
+        "stats": stats,
+    }
+
+
+def _parse_side(t):
+    if not isinstance(t, dict):
+        return None
+    starters = [_parse_player(p) for p in (t.get("lineups") or []) if isinstance(p, dict)]
+    subs = [_parse_player(p) for p in (t.get("sub") or []) if isinstance(p, dict)]
+    rated = [p["rate"] for p in starters if p.get("rate")]
+    return {
+        "team_id": str(t.get("team_id") or ""),
+        "name": t.get("team_name") or "",
+        "logo": t.get("team_logo") or "",
+        "formation": t.get("formation") or "",
+        "coach": t.get("team_coach") or "",
+        "market_value": t.get("team_market_value") or "",
+        "age": t.get("team_age") or "",
+        "starters": starters,
+        "subs": subs,
+        "avg_rate": round(sum(rated) / len(rated), 2) if rated else None,
+        "mvp": next((p["name"] for p in starters + subs if p.get("mvp")), ""),
+    }
+
+
+def fetch_match_lineup(match_id):
+    """比赛阵容 + 评分。返回 {"base","status","A","B"}；A/B 含首发 11 人评分与平均分。"""
+    d = _sget(f"dqd/v1/match/lineup/{match_id}")
+    if not isinstance(d, dict):
+        return {}
+    persons = d.get("persons") or {}
+    return {
+        "base": d.get("base") or {},
+        "status": d.get("match_status") or "",
+        "A": _parse_side(persons.get("team_A")),
+        "B": _parse_side(persons.get("team_B")),
+        "sideline": d.get("sideline") or {},
+    }
+
+
+def fetch_team_profile(team_id):
+    """球队资料：城市 / 成立年份 / 主场 / 容量 / 身价 / 排名。"""
+    d = _sget(f"dqd/team/sample/{team_id}")
+    if not isinstance(d, dict):
+        return {}
+    return {
+        "name": d.get("team_name") or "",
+        "en_name": d.get("team_en_name") or "",
+        "logo": d.get("team_logo") or "",
+        "country": d.get("country") or "",
+        "city": d.get("city") or "",
+        "founded": d.get("founded") or "",
+        "venue": d.get("venue_name") or "",
+        "capacity": d.get("venue_capacity") or "",
+        "market_value": d.get("market_value") or "",
+        "rank": d.get("rank") or "",
+        "nickname": d.get("nickname") or "",
+    }
+
+
+def fetch_team_ratings(team_id, limit=6):
+    """抓球队最近 limit 场已结束比赛的阵容，汇总每名球员的场均评分。
+
+    返回 {"matches":[...], "players":[{name,position,matches,avg_rate,best,ratings}],
+          "team_avg": float|None}
+    """
+    sched = [m for m in fetch_team_schedule(team_id)
+             if m.get("status") == "Played" and m["match_id"]]
+    sched = list(reversed(sched))[:limit]          # 最近的在前
+    matches, agg = [], {}
+    for m in sched:
+        try:
+            lu = fetch_match_lineup(m["match_id"])
+        except Exception:  # noqa: BLE001
+            continue
+        side = None
+        for k in ("A", "B"):
+            t = lu.get(k)
+            if t and t.get("team_id") == str(team_id):
+                side = t
+                break
+        if not side:
+            continue
+        matches.append({
+            "match_id": m["match_id"],
+            "label": f"{m['home']} {m['score']} {m['away']}".strip(),
+            "competition": m["competition"],
+            "start_play": m["start_play"],
+            "avg_rate": side.get("avg_rate"),
+            "formation": side.get("formation"),
+            "mvp": side.get("mvp"),
+        })
+        for p in side.get("starters") or []:
+            if not p.get("rate"):
+                continue
+            e = agg.setdefault(p["name"], {"name": p["name"],
+                                           "position": p["position"], "ratings": []})
+            e["ratings"].append(p["rate"])
+    players = []
+    for e in agg.values():
+        rs = e["ratings"]
+        players.append({
+            "name": e["name"], "position": e["position"], "matches": len(rs),
+            "avg_rate": round(sum(rs) / len(rs), 2), "best": max(rs), "ratings": rs,
+        })
+    players.sort(key=lambda x: (-x["matches"], -x["avg_rate"]))
+    team_vals = [m["avg_rate"] for m in matches if m.get("avg_rate")]
+    return {
+        "matches": matches,
+        "players": players,
+        "team_avg": round(sum(team_vals) / len(team_vals), 2) if team_vals else None,
+    }

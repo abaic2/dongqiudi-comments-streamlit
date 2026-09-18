@@ -1039,6 +1039,60 @@ def chart_player_seasons(seasons, top=10):
     }
 
 
+def chart_player_rating(players, top=15):
+    """球员场均评分（横向柱）。"""
+    d = list(reversed(players[:top]))
+    return {
+        "grid": {"left": 96, "right": 44, "top": 16, "bottom": 24},
+        "tooltip": {"trigger": "axis"},
+        "xAxis": {"type": "value", "min": 5, "max": 10, "splitLine": _GRID},
+        "yAxis": {"type": "category", "data": [p["name"] for p in d],
+                  "axisLabel": {"fontSize": 11, "color": "#15181d"}},
+        "series": [{"type": "bar", "name": "场均评分", "data": [p["avg_rate"] for p in d],
+                    "itemStyle": {"color": _RED, "borderRadius": [0, 4, 4, 0]},
+                    "label": {"show": True, "position": "right", "fontSize": 10,
+                              "color": "#6b7280"}}],
+    }
+
+
+def chart_lineup_compare(A, B):
+    """两队首发 11 人评分对比。"""
+    a, b = A.get("starters") or [], B.get("starters") or []
+    n = max(len(a), len(b))
+    return {
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 46, "bottom": 40},
+        "xAxis": {"type": "category", "data": [f"第{i + 1}人" for i in range(n)],
+                  "axisLabel": {"fontSize": 11, "color": "#6b7280"}},
+        "yAxis": {"type": "value", "min": 4, "max": 10, "splitLine": _GRID},
+        "series": [
+            {"name": f"{A.get('name')}（首发均分 {A.get('avg_rate')}）", "type": "bar",
+             "data": [p.get("rate") for p in a],
+             "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]}},
+            {"name": f"{B.get('name')}（首发均分 {B.get('avg_rate')}）", "type": "bar",
+             "data": [p.get("rate") for p in b],
+             "itemStyle": {"color": "#4b7bec", "borderRadius": [3, 3, 0, 0]}},
+        ],
+    }
+
+
+def chart_rating_trend(matches):
+    """球队首发均分走势。"""
+    d = list(reversed(matches))
+    return {
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 26, "bottom": 78},
+        "xAxis": {"type": "category", "data": [m["label"] for m in d],
+                  "axisLabel": {"rotate": 32, "fontSize": 10, "color": "#6b7280"}},
+        "yAxis": {"type": "value", "min": 5, "max": 10, "splitLine": _GRID},
+        "series": [{"type": "line", "name": "首发均分", "smooth": True,
+                    "data": [m["avg_rate"] for m in d],
+                    "itemStyle": {"color": _RED}, "lineStyle": {"width": 3},
+                    "label": {"show": True, "fontSize": 10, "color": "#6b7280"}}],
+    }
+
+
 # ------------------------- UI（仅在 streamlit 运行时执行） -------------------
 def main():
     st.set_page_config(page_title="懂球帝 · 评论爬取 + 数据分析", page_icon="⚽", layout="wide")
@@ -1427,8 +1481,9 @@ def page_data():
         (round(tot_gf / max(1, played), 2), "场均进球", ""),
     ]), unsafe_allow_html=True)
 
-    t1, t2, t3, t4, t5 = st.tabs(["📋 积分榜", "⚽ 射手榜", "⚖️ 球队对比",
-                                  "🏟️ 球队详情", "👤 球员详情"])
+    t1, t2, t_rt, t_pr, t3, t4, t5 = st.tabs([
+        "📋 积分榜", "⚽ 射手榜", "🎯 阵容与评分", "📈 球员评分榜",
+        "⚖️ 球队对比", "🏟️ 球队详情", "👤 球员详情"])
 
     # ---------- 1) 积分榜 ----------
     with t1:
@@ -1470,7 +1525,128 @@ def page_data():
                 st.dataframe(pd.DataFrame(sc_rows)[["排名", "球员", "球队", "进球"]],
                              width="stretch", height=400, hide_index=True)
 
-    # ---------- 3) 球队对比 ----------
+    # ---------- 阵容与评分：首发 11 人评分 + 球队评分（首发均分）----------
+    with t_rt:
+        teams_sd = [(r["球队"], DD.sport_team_id(r.get("team_id")))
+                    for r in st_rows if r.get("team_id")]
+        if not teams_sd:
+            st.info("暂无球队 ID，无法加载阵容与评分。")
+        else:
+            st.caption("球队评分 = 该场**首发 11 人评分的平均分**（懂球帝官网评分口径）；"
+                       "评分来自比赛阵容接口（首发 11 人）。")
+            tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rating_team")
+            tid = dict(teams_sd)[tn]
+            try:
+                with st.spinner("正在加载球队赛程…"):
+                    sched = _cached(f"sched_{tid}", DD.fetch_team_schedule, tid)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"赛程加载失败：{type(e).__name__}: {e}")
+                sched = []
+            played = [m for m in sched if m.get("status") == "Played"]
+            if not played:
+                st.info("该队暂无已结束的比赛，取不到评分。")
+            else:
+                opts = {}
+                for m in list(reversed(played))[:20]:
+                    opts[f"{m['start_play'][:10]}　{m['home']} {m['score']} {m['away']}"
+                         f"（{m['competition']}）"] = m
+                lab = st.selectbox("选择比赛（最近 20 场已结束）", list(opts.keys()),
+                                   key="dt_match")
+                mid = opts[lab]["match_id"]
+                try:
+                    with st.spinner("正在加载比赛阵容与评分…"):
+                        lu = _cached(f"lineup_{mid}", DD.fetch_match_lineup, mid)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"阵容加载失败：{type(e).__name__}: {e}")
+                    lu = {}
+                A, B = lu.get("A"), lu.get("B")
+                if A and B:
+                    st.markdown(render_stat_tiles([
+                        (A.get("avg_rate") or "—", f"{A.get('name')} 首发评分", "red"),
+                        (B.get("avg_rate") or "—", f"{B.get('name')} 首发评分", ""),
+                        (A.get("formation") or "—", f"{A.get('name')} 阵型", ""),
+                        (f"{A.get('market_value') or '—'} / {B.get('market_value') or '—'}",
+                         "身价对比", ""),
+                    ]), unsafe_allow_html=True)
+                    with st.container(border=True, key="dt_p_lineup_chart"):
+                        st.markdown(render_h("两队首发 11 人评分对比"), unsafe_allow_html=True)
+                        echarts(chart_lineup_compare(A, B), 380)
+                    cA, cB = st.columns(2, gap="large")
+                    for col, t in ((cA, A), (cB, B)):
+                        with col:
+                            with st.container(border=True, key=f"dt_p_side_{t.get('team_id')}"):
+                                st.markdown(render_h(
+                                    f"{t['name']} · 首发 11 人（均分 {t['avg_rate']}）"),
+                                    unsafe_allow_html=True)
+                                df = pd.DataFrame([{
+                                    "号码": p["shirt"], "位置": p["position"], "球员": p["name"],
+                                    "评分": p["rate"], "队长": "✓" if p["captain"] else "",
+                                    "MVP": "★" if p["mvp"] else "",
+                                } for p in t["starters"]])
+                                st.dataframe(df, width="stretch", hide_index=True, height=430)
+                                st.caption(f"主帅：{t['coach'] or '—'}　·　平均年龄："
+                                           f"{t['age'] or '—'}　·　全场最佳：{t['mvp'] or '—'}")
+                    if lu.get("base"):
+                        b = lu["base"]
+                        st.caption(f"场地：{b.get('field') or '—'}　·　天气："
+                                   f"{b.get('weather') or '—'}　·　主裁：{b.get('referee') or '—'}")
+                else:
+                    st.info("该场暂无阵容评分数据（可能未开赛或数据未生成）。")
+
+    # ---------- 球员评分榜：多场汇总的场均评分 ----------
+    with t_pr:
+        teams_sd = [(r["球队"], DD.sport_team_id(r.get("team_id")))
+                    for r in st_rows if r.get("team_id")]
+        if not teams_sd:
+            st.info("暂无球队 ID。")
+        else:
+            cc1, cc2 = st.columns([2, 1], gap="medium")
+            with cc1:
+                tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rt_team")
+            with cc2:
+                n = st.selectbox("汇总场次", [3, 5, 8, 10], index=1, key="dt_rt_n")
+            tid = dict(teams_sd)[tn]
+            try:
+                with st.spinner(f"正在抓取「{tn}」最近 {n} 场阵容评分…"):
+                    rk = _cached(f"ratings_{tid}_{n}", DD.fetch_team_ratings, tid, n)
+            except Exception as e:  # noqa: BLE001
+                st.error(f"评分加载失败：{type(e).__name__}: {e}")
+                rk = {}
+            players, matches = rk.get("players") or [], rk.get("matches") or []
+            if not players:
+                st.info("暂无可汇总的评分数据。")
+            else:
+                st.markdown(render_stat_tiles([
+                    (rk.get("team_avg") or "—", f"{tn} 场均首发评分", "red"),
+                    (len(matches), "统计场次", ""),
+                    (len(players), "涉及球员", ""),
+                    (players[0]["name"], "场均最高", ""),
+                ]), unsafe_allow_html=True)
+                cc3, cc4 = st.columns([1.2, 1], gap="large")
+                with cc3:
+                    with st.container(border=True, key="dt_p_pr_bar"):
+                        st.markdown(render_h("球员场均评分 Top 15"), unsafe_allow_html=True)
+                        echarts(chart_player_rating(players, 15), 430)
+                with cc4:
+                    with st.container(border=True, key="dt_p_pr_trend"):
+                        st.markdown(render_h("球队首发均分走势"), unsafe_allow_html=True)
+                        echarts(chart_rating_trend(matches), 430)
+                with st.container(border=True, key="dt_p_pr_table"):
+                    st.markdown(render_h("球员场均评分明细（按场均降序）"), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame([{
+                        "球员": p["name"], "位置": p["position"], "出场": p["matches"],
+                        "场均评分": p["avg_rate"], "最高": p["best"],
+                        "各场评分": " / ".join(str(x) for x in p["ratings"]),
+                    } for p in sorted(players, key=lambda x: -x["avg_rate"])]),
+                        width="stretch", hide_index=True, height=420)
+                with st.container(border=True, key="dt_p_pr_matches"):
+                    st.markdown(render_h("统计到的比赛"), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame([{
+                        "比赛": m["label"], "赛事": m["competition"], "时间": m["start_play"][:16],
+                        "阵型": m["formation"], "首发均分": m["avg_rate"], "MVP": m["mvp"],
+                    } for m in matches]), width="stretch", hide_index=True, height=260)
+
+    # ---------- 5) 球队对比 ----------
     with t3:
         names_all = [r["球队"] for r in st_rows]
         pick = st.multiselect("选择要对比的球队（默认前 6 名）", names_all,
@@ -1487,7 +1663,7 @@ def page_data():
         else:
             st.info("请至少选择一支球队。")
 
-    # ---------- 4) 球队详情 ----------
+    # ---------- 6) 球队详情 ----------
     with t4:
         teams = [r for r in st_rows if r.get("team_id")]
         if not teams:
@@ -1529,7 +1705,7 @@ def page_data():
             st.caption("提示：想分析某条新闻的评论，可切到「📰 评论爬取」，"
                        "用「按链接 / 文章 ID 直接打开」粘贴上面的文章 ID。")
 
-    # ---------- 5) 球员详情 ----------
+    # ---------- 7) 球员详情 ----------
     with t5:
         opts = {f"{r['球员']}（{r['球队']} · {r['进球']}球）": r
                 for r in sc_rows if r.get("player_id")}
