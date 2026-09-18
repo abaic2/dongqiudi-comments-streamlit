@@ -930,6 +930,45 @@ def _cached(key, fn, *args):
     return cache[key]
 
 
+def _team_pack(team_id, season=None, form_limit=6):
+    """赛果预测用：某队「最近一场首发的能力值」+「近期状态」。"""
+    sched = [m for m in DD.fetch_team_schedule(team_id, season=season)
+             if m.get("status") == "Played" and m.get("match_id")]
+    ability, side_name = {}, ""
+    if sched:
+        last = sched[-1]
+        ids = set(DD.sport_team_id_variants(team_id))
+        ids.update(str(x) for x in (last.get("my_ids") or []) if x)
+        ids.discard("")
+        try:
+            lu = DD.fetch_match_lineup(last["match_id"])
+            side = next((lu.get(k) for k in ("A", "B")
+                         if lu.get(k) and str(lu[k].get("team_id")) in ids), None)
+            if side:
+                ability = DD.fetch_team_ability(side["starters"], side["name"])
+                side_name = side["name"] or ""
+        except Exception:  # noqa: BLE001
+            pass
+    form = DD.fetch_team_form(team_id, limit=form_limit, season=season)
+    return {"ability": ability, "form": form, "name": side_name,
+            "last_match": sched[-1] if sched else None}
+
+
+def _season_picker(team_id, key, label="赛季"):
+    """历史赛季下拉（默认当前赛季）。返回 (season 值, 展示名)。"""
+    try:
+        seasons = _cached(f"seasons_{team_id}", DD.fetch_team_seasons, team_id)
+    except Exception:  # noqa: BLE001
+        seasons = []
+    if not seasons:
+        return None, ""
+    opts = [s["name"] for s in seasons]
+    idx = next((i for i, s in enumerate(seasons) if s["current"]), 0)
+    pick = st.selectbox(label, opts, index=idx, key=key,
+                        help="可选历史赛季（数据来自懂球帝赛程接口）")
+    return next((s["season"] for s in seasons if s["name"] == pick), None), pick
+
+
 def chart_points(rows, top=12):
     d = rows[:top]
     return {
@@ -1196,6 +1235,113 @@ def chart_ability_rank(items, top=15):
                     "itemStyle": {"color": _RED2, "borderRadius": [0, 4, 4, 0]},
                     "label": {"show": True, "position": "right", "fontSize": 10,
                               "color": "#6b7280"}}],
+    }
+
+
+def chart_indicators_compare(ia, ib=None, name_a="", name_b="", group_color=True):
+    """各指标平均分对比（横向柱，按「进攻/技巧/移动…」分组着色或双色对比）。
+
+    ia / ib: [{"组","指标","数值"}]（来自 fetch_team_ability 的 indicators_avg）。
+    """
+    ib = ib or []
+    base = ia or ib
+    if not base:
+        return {"series": []}
+    cats, order, groups = [], [], []
+    for it in base:
+        order.append(it["指标"])
+        cats.append(f"{it['指标']}")
+        groups.append(it.get("组") or "")
+    ma = {it["指标"]: it["数值"] for it in ia}
+    mb = {it["指标"]: it["数值"] for it in ib}
+
+    def _rev(seq):
+        return list(reversed(seq))
+
+    if ia and ib:
+        series = [
+            {"name": name_a or "主队", "type": "bar", "data": _rev([ma.get(k) for k in order]),
+             "itemStyle": {"color": _RED, "borderRadius": [0, 3, 3, 0]}},
+            {"name": name_b or "客队", "type": "bar", "data": _rev([mb.get(k) for k in order]),
+             "itemStyle": {"color": _BLUE, "borderRadius": [0, 3, 3, 0]}},
+        ]
+        color = [_RED, _BLUE]
+    else:
+        src = ma if ia else mb
+        series = [{"type": "bar", "name": "指标平均分",
+                   "data": _rev([src.get(k) for k in order]),
+                   "itemStyle": {"color": _RED2, "borderRadius": [0, 3, 3, 0]},
+                   "label": {"show": True, "position": "right", "fontSize": 9.5,
+                             "color": "#6b7280"}}]
+        color = [_RED2]
+    n = len(order)
+    return {
+        "color": color,
+        "legend": ({"top": 0, "textStyle": {"fontSize": 12}} if (ia and ib)
+                   else {"show": False}),
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 84, "right": 52, "top": 40 if (ia and ib) else 16,
+                 "bottom": 18},
+        "xAxis": {"type": "value", "max": 100, "splitLine": _GRID,
+                  "axisLabel": {"fontSize": 10, "color": "#9ca3af"}},
+        "yAxis": {"type": "category", "data": _rev(cats),
+                  "axisLabel": {"fontSize": 10, "color": "#15181d"}},
+        "series": series,
+    }
+
+
+def chart_win_prob(pred, home_name, away_name):
+    """胜平负概率（100% 堆叠横条）。"""
+    seg = [(f"{home_name} 胜", pred.get("p_home"), _RED),
+           ("平局", pred.get("p_draw"), "#f2a33c"),
+           (f"{away_name} 胜", pred.get("p_away"), _BLUE)]
+    return {
+        "tooltip": {"trigger": "axis"},
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "grid": {"left": 12, "right": 12, "top": 44, "bottom": 22},
+        "xAxis": {"type": "value", "max": 100, "show": False},
+        "yAxis": {"type": "category", "data": [""], "show": False},
+        "series": [{
+            "name": nm, "type": "bar", "stack": "p", "data": [v],
+            "itemStyle": {"color": c},
+            "label": {"show": True, "position": "inside", "color": "#fff",
+                      "fontSize": 12, "fontWeight": "bold", "formatter": "{c}%"},
+        } for nm, v, c in seg],
+    }
+
+
+def chart_score_matrix(pred, home_name, away_name, nmax=5):
+    """比分概率热力图（0~nmax 球）。"""
+    n = nmax + 1
+    grid = pred.get("grid") or []
+    data = []
+    for i in range(n):
+        for j in range(n):
+            v = grid[i][j] if (i < len(grid) and j < len(grid[i])) else 0
+            data.append([i, j, round(v, 1)])
+    hi = max((d[2] for d in data), default=1) or 1
+    return {
+        "tooltip": {"trigger": "item"},
+        "grid": {"left": 58, "right": 20, "top": 18, "bottom": 66},
+        "xAxis": {"type": "category", "data": [str(i) for i in range(n)],
+                  "name": f"{home_name} 进球", "nameLocation": "middle",
+                  "nameGap": 28, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
+                  "splitArea": {"show": True}},
+        "yAxis": {"type": "category", "data": [str(j) for j in range(n)],
+                  "name": f"{away_name} 进球", "nameLocation": "middle",
+                  "nameGap": 38, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
+                  "splitArea": {"show": True}},
+        "visualMap": {"min": 0, "max": round(hi, 1), "calculable": True,
+                      "orient": "horizontal", "left": "center", "bottom": 4,
+                      "itemWidth": 12, "itemHeight": 90,
+                      "textStyle": {"fontSize": 10, "color": "#6b7280"},
+                      "inRange": {"color": ["#fff7f7", "#fbd5d5", "#ef8a8a",
+                                            "#d51d2a", "#7d0c16"]}},
+        "series": [{"type": "heatmap", "data": data,
+                    "label": {"show": True, "fontSize": 9, "color": "#15181d",
+                              "formatter": "{c}%"},
+                    "emphasis": {"itemStyle": {"shadowBlur": 8,
+                                               "shadowColor": "rgba(0,0,0,.28)"}}}],
     }
 
 
@@ -1621,9 +1767,9 @@ def page_data():
         (round(tot_gf / max(1, played), 2), "场均进球", ""),
     ]), unsafe_allow_html=True)
 
-    t1, t2, t_rt, t_pr, t3, t4, t5 = st.tabs([
+    t1, t2, t_rt, t_pr, t_pred, t3, t4, t5 = st.tabs([
         "📋 积分榜", "⚽ 射手榜", "🎯 阵容 · 评分与能力", "📈 球员评分 · 能力榜",
-        "⚖️ 球队对比", "🏟️ 球队详情", "👤 球员详情"])
+        "🔮 赛果预测", "⚖️ 球队对比", "🏟️ 球队详情", "👤 球员详情"])
 
     # ---------- 1) 积分榜 ----------
     with t1:
@@ -1677,16 +1823,20 @@ def page_data():
                        "比赛评分的平均分**作为对照。")
             tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rating_team")
             tid = dict(teams_sd)[tn]
+            season, season_label = _season_picker(tid, "dt_rt_season")
             try:
                 with st.spinner("正在加载球队赛程…"):
-                    sched = _cached(f"sched_{tid}", DD.fetch_team_schedule, tid)
+                    sched = _cached(f"sched_{tid}_{season}", DD.fetch_team_schedule,
+                                    tid, season)
             except Exception as e:  # noqa: BLE001
                 st.error(f"赛程加载失败：{type(e).__name__}: {e}")
                 sched = []
             played = [m for m in sched if m.get("status") == "Played"]
             if not played:
-                st.info("该队暂无已结束的比赛，取不到评分。")
+                st.info(f"「{tn}」在 {season_label or '当前赛季'} 暂无已结束的比赛，"
+                        f"换个赛季或球队试试。")
             else:
+                st.caption(f"当前查看：**{season_label}** · 已结束 {len(played)} 场")
                 opts = {}
                 for m in list(reversed(played))[:20]:
                     opts[f"{m['start_play'][:10]}　{m['home']} {m['score']} {m['away']}"
@@ -1827,6 +1977,31 @@ def page_data():
                             st.caption("分组均值取该队**非门将首发**在该组各项指标的平均分"
                                        "（门将的门前指标另见图）。")
 
+                    # ---- 各指标平均分（28 项，传球 / 身体 / 射门…）----
+                    ia = abA.get("indicators_avg") or []
+                    ib = abB.get("indicators_avg") or []
+                    if ia or ib:
+                        with st.container(border=True, key="dt_p_indicators"):
+                            st.markdown(render_h("两队各指标平均分对比（非门将首发逐项平均）"),
+                                        unsafe_allow_html=True)
+                            echarts(chart_indicators_compare(ia, ib, A.get("name") or "",
+                                                             B.get("name") or ""), 820)
+                            st.caption("逐项平均分 = 该队非门将首发球员在此指标上数值的平均值"
+                                       "（共 28 项，已排除门将占位项）。")
+                            if ia:
+                                dfi = pd.DataFrame({
+                                    "组": [x["组"] for x in ia],
+                                    "指标": [x["指标"] for x in ia],
+                                    (A.get("name") or "主队"): [x["数值"] for x in ia],
+                                })
+                                if ib:
+                                    mp = {x["指标"]: x["数值"] for x in ib}
+                                    dfi[B.get("name") or "客队"] = [mp.get(x["指标"]) for x in ia]
+                                    dfi["差值"] = [round(x["数值"] - (mp.get(x["指标"]) or 0), 1)
+                                                   for x in ia]
+                                st.dataframe(dfi, width="stretch", hide_index=True,
+                                             height=320)
+
                     # ---- 单名球员的能力明细 ----
                     allp = {q.get("name"): q for q in (abA.get("players") or [])
                             + (abB.get("players") or []) if q.get("avg")}
@@ -1878,21 +2053,26 @@ def page_data():
         if not teams_sd:
             st.info("暂无球队 ID。")
         else:
-            cc1, cc2 = st.columns([2, 1], gap="medium")
+            cc1, cc2, cc3 = st.columns([2, 1, 1], gap="medium")
             with cc1:
                 tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rt_team")
+            tid = dict(teams_sd)[tn]
             with cc2:
                 n = st.selectbox("汇总场次", [3, 5, 8, 10], index=1, key="dt_rt_n")
-            tid = dict(teams_sd)[tn]
+            with cc3:
+                season, season_label = _season_picker(tid, "dt_pr_season")
             try:
-                with st.spinner(f"正在抓取「{tn}」最近 {n} 场阵容评分…"):
-                    rk = _cached(f"ratings_{tid}_{n}", DD.fetch_team_ratings, tid, n)
+                with st.spinner(f"正在抓取「{tn}」{season_label or '当前赛季'} 最近 {n} 场"
+                                f"阵容评分…"):
+                    rk = _cached(f"ratings_{tid}_{n}_{season}",
+                                 DD.fetch_team_ratings, tid, n, season)
             except Exception as e:  # noqa: BLE001
                 st.error(f"评分加载失败：{type(e).__name__}: {e}")
                 rk = {}
             players, matches = rk.get("players") or [], rk.get("matches") or []
             if not players:
-                st.info("暂无可汇总的评分数据。")
+                st.info(f"「{tn}」在 {season_label or '当前赛季'} 暂无可汇总的评分数据，"
+                        f"换个赛季或球队试试。")
             else:
                 try:
                     with st.spinner("正在加载球员能力值…"):
@@ -1978,6 +2158,133 @@ def page_data():
                         "比赛": m["label"], "赛事": m["competition"], "时间": m["start_play"][:16],
                         "阵型": m["formation"], "首发均分": m["avg_rate"], "MVP": m["mvp"],
                     } for m in matches]), width="stretch", hide_index=True, height=260)
+
+    # ---------- 赛果预测：胜率 + 比分 ----------
+    with t_pred:
+        st.caption("**预测模型（启发式，非赔率，仅供参考）**：先用首发 11 人的能力值推出"
+                   "**进攻 / 防守 / 门将指数**，再与两队**近期场均进失球**按权重混合"
+                   "（小样本噪声已做向均值收缩），得到各自的期望进球；"
+                   "最后用**泊松分布**算出胜平负与各比分的概率。"
+                   "「近期状态权重」可调：0% 完全看能力值，100% 更看重近期战绩。")
+        names_all = [r["球队"] for r in st_rows]
+        tmap = {r["球队"]: r.get("team_id") for r in st_rows}
+        if len(names_all) < 2:
+            st.info("该联赛球队不足 2 支，无法做赛果预测。")
+        else:
+            c1, c2, c3 = st.columns([1.1, 1.1, 1], gap="medium")
+            with c1:
+                hname = st.selectbox("主队", names_all, index=0, key="pd_home")
+            with c2:
+                aname = st.selectbox("客队", names_all, index=1, key="pd_away")
+            hid, aid = tmap.get(hname), tmap.get(aname)
+            with c3:
+                season, season_label = (_season_picker(hid, "pd_season")
+                                        if hid else (None, ""))
+            c4, c5 = st.columns([1, 1], gap="medium")
+            with c4:
+                fw = st.slider("近期状态权重（%）", 0, 100, 40, 5, key="pd_formw")
+            with c5:
+                fl = st.selectbox("近期场次", [4, 6, 8, 10], index=1, key="pd_formn",
+                                  help="计算「近期场均进失球」取最近几场")
+
+            if not hid or not aid:
+                st.info("缺少球队 ID，无法预测。")
+            elif hname == aname:
+                st.warning("主队和客队不能是同一支球队。")
+            else:
+                base = DD.league_goal_baseline(st_rows)
+                try:
+                    with st.spinner("正在计算预测（读取能力值与近期状态）…"):
+                        hp = _cached(f"pk_{hid}_{season}_{fl}", _team_pack, hid, season, fl)
+                        ap = _cached(f"pk_{aid}_{season}_{fl}", _team_pack, aid, season, fl)
+                except Exception as e:  # noqa: BLE001
+                    st.error(f"预测数据加载失败：{type(e).__name__}: {e}")
+                    hp = ap = {}
+                pred = DD.poisson_predict(hp.get("ability") or {}, hp.get("form") or {},
+                                          ap.get("ability") or {}, ap.get("form") or {},
+                                          baseline=base, form_weight=fw / 100.0)
+                best = pred["top_scores"][0]["score"] if pred["top_scores"] else "—"
+                st.markdown(render_stat_tiles([
+                    (f"{pred['p_home']}%", f"{hname} 胜", "red"),
+                    (f"{pred['p_draw']}%", "平局", ""),
+                    (f"{pred['p_away']}%", f"{aname} 胜", ""),
+                    (best, "最可能比分", "red"),
+                ]), unsafe_allow_html=True)
+                st.caption(f"期望进球　{hname} **{pred['lambda_home']}** ／ {aname} "
+                           f"**{pred['lambda_away']}**　·　联赛基线（每队每场）"
+                           f"{base} 球　·　近期状态权重 {fw}%　·　赛季 "
+                           f"{season_label or '当前'}")
+
+                p1, p2 = st.columns([1, 1.2], gap="large")
+                with p1:
+                    with st.container(border=True, key="pd_prob"):
+                        st.markdown(render_h("胜平负概率"), unsafe_allow_html=True)
+                        echarts(chart_win_prob(pred, hname, aname), 170)
+                        st.dataframe(pd.DataFrame([
+                            {"比分": s["score"], "概率": f"{s['p']:.1f}%"}
+                            for s in pred["top_scores"]]),
+                            width="stretch", hide_index=True, height=230)
+                with p2:
+                    with st.container(border=True, key="pd_matrix"):
+                        st.markdown(render_h("比分概率矩阵（行=客队进球，列=主队进球）"),
+                                    unsafe_allow_html=True)
+                        echarts(chart_score_matrix(pred, hname, aname), 430)
+
+                hs, as_ = pred["strength"]["home"], pred["strength"]["away"]
+                hf, af = hp.get("form") or {}, ap.get("form") or {}
+                hab, aab = hp.get("ability") or {}, ap.get("ability") or {}
+                with st.container(border=True, key="pd_basis"):
+                    st.markdown(render_h("预测依据"), unsafe_allow_html=True)
+
+                    def _s(v):
+                        return "—" if v is None or v == "" else str(v)
+
+                    st.dataframe(pd.DataFrame([
+                        {"项目": "球队能力评分（首发11人均值）",
+                         hname: _s(hab.get("team_avg")), aname: _s(aab.get("team_avg"))},
+                        {"项目": "进攻指数", hname: _s(hs.get("attack")),
+                         aname: _s(as_.get("attack"))},
+                        {"项目": "防守指数", hname: _s(hs.get("defense")),
+                         aname: _s(as_.get("defense"))},
+                        {"项目": "门将指数", hname: _s(hs.get("gk")), aname: _s(as_.get("gk"))},
+                        {"项目": f"近期战绩（近{fl}场）",
+                         hname: f"{hf.get('w', 0)}胜{hf.get('d', 0)}平{hf.get('l', 0)}负",
+                         aname: f"{af.get('w', 0)}胜{af.get('d', 0)}平{af.get('l', 0)}负"},
+                        {"项目": "近期场均进球", hname: _s(hf.get("gf_pg")),
+                         aname: _s(af.get("gf_pg"))},
+                        {"项目": "近期场均失球", hname: _s(hf.get("ga_pg")),
+                         aname: _s(af.get("ga_pg"))},
+                        {"项目": "近期场均积分", hname: _s(hf.get("ppg")),
+                         aname: _s(af.get("ppg"))},
+                        {"项目": "进攻系数（越大越强）", hname: _s(hs.get("atk_mult")),
+                         aname: _s(as_.get("atk_mult"))},
+                        {"项目": "防守系数（越大越稳）", hname: _s(hs.get("def_mult")),
+                         aname: _s(as_.get("def_mult"))},
+                    ]), width="stretch", hide_index=True, height=396)
+
+                hia = hab.get("indicators_avg") or []
+                aia = aab.get("indicators_avg") or []
+                if hia or aia:
+                    with st.container(border=True, key="pd_indicators"):
+                        st.markdown(render_h("两队各指标平均分对比（预测所用的能力值基础）"),
+                                    unsafe_allow_html=True)
+                        echarts(chart_indicators_compare(hia, aia, hname, aname), 820)
+
+                if (hf.get("matches") or af.get("matches")):
+                    with st.container(border=True, key="pd_form"):
+                        st.markdown(render_h("近期状态（最近在前）"), unsafe_allow_html=True)
+                        f1, f2 = st.columns(2, gap="large")
+                        for col, nm, f in ((f1, hname, hf), (f2, aname, af)):
+                            with col:
+                                st.markdown(render_h(f"{nm} · 近 {fl} 场（"
+                                                     f"场均进 {f.get('gf_pg')} / 失 "
+                                                     f"{f.get('ga_pg')}）"),
+                                            unsafe_allow_html=True)
+                                st.dataframe(pd.DataFrame([{
+                                    "日期": m["start_play"][:10], "赛事": m["competition"],
+                                    "比赛": m["label"], "结果": m["result"],
+                                } for m in (f.get("matches") or [])]),
+                                    width="stretch", hide_index=True, height=280)
 
     # ---------- 5) 球队对比 ----------
     with t3:

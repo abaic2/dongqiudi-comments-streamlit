@@ -335,13 +335,32 @@ def fetch_sport_ranking(season_id, kind="person", rtype="goals"):
     return rows or []
 
 
+def fetch_team_seasons(team_id, limit=16):
+    """该队可选的历史赛季（来自赛程接口的 season_list）。
+
+    返回 [{"name":"2026/2027", "season":"2026-2027", "current": True}, ...]，最近的在前。
+    """
+    c = _sget(f"dqd/team/schedule/{team_id}")
+    out = []
+    for sl in (c.get("season_list") or []) if isinstance(c, dict) else []:
+        mm = re.search(r"season=([\d-]+)", (sl or {}).get("url") or "")
+        if not mm:
+            continue
+        out.append({"name": (sl.get("name") or "").strip() or mm.group(1),
+                    "season": mm.group(1),
+                    "current": bool(sl.get("current"))})
+    return out[:limit]
+
+
 def fetch_team_schedule(team_id, season=None):
     """球队赛程。status=Played 表示已结束（可用于取 match_id 查阵容评分）。
 
-    入参 `team_id` 用**网页版原值**（513 / 1755 / 76899…，实测在所有联赛都可用）。
+    入参 `team_id` 用**网页版原值**（513 / 1755 / 76899…，实测在所有联赛都可用）；
+    `season` 传 "2025-2026" 这类值即可查历史赛季（来自 fetch_team_seasons）。
     比赛条目里的 team_A_id/team_B_id 是 sport-data 的内部 ID（50000513 / 50001755…），
     这里通过 season_list 的 url 解析出本队的内部 ID，放在每条的 `my_id` 上，
     供上层比对阵容（lineup）里的 team_id。另外 `my_ids` 一次性返回全部可能写法。
+    每条比赛还带 `gf`/`ga`（本队进球/失球，用于近期状态与预测）。
     """
     params = {"season": season} if season else {}
     c = _sget(f"dqd/team/schedule/{team_id}", params)
@@ -359,6 +378,11 @@ def fetch_team_schedule(team_id, season=None):
         aid = str(m.get("team_A_id") or "")
         bid = str(m.get("team_B_id") or "")
         my_id = aid if aid in my_ids else (bid if bid in my_ids else "")
+        fa, fb = _int(m.get("fs_A")), _int(m.get("fs_B"))
+        is_home = aid in my_ids
+        gf = ga = None
+        if my_id and fa is not None and fb is not None:
+            gf, ga = (fa, fb) if is_home else (fb, fa)
         out.append({
             "match_id": str(m.get("match_id")),
             "competition": m.get("competition_name") or "",
@@ -367,13 +391,14 @@ def fetch_team_schedule(team_id, season=None):
             "away": m.get("team_B_name") or "",
             "home_id": aid,
             "away_id": bid,
-            "score": (f"{m.get('fs_A')}-{m.get('fs_B')}"
-                      if m.get("fs_A") not in (None, "") else ""),
+            "score": (f"{fa}-{fb}" if fa is not None and fb is not None else ""),
+            "gf": gf,
+            "ga": ga,
             "start_play": m.get("start_play") or "",
             "status": m.get("status") or "",
             "my_id": my_id,
             "my_ids": sorted(my_ids),
-            "is_home": aid in my_ids,
+            "is_home": is_home,
         })
     return out
 
@@ -552,13 +577,15 @@ def fetch_team_ability(starters, team_name="", workers=8):
 
     返回 {name, players:[{id,name,position,shirt,rate,avg,radar,is_gk}],
           team_avg, radar:{维度:值}, radar_list:[{name,val}], gk_radar, gk_name,
-          covered, total, groups_avg:{组:均值}}
+          covered, total, groups_avg:{组:均值},
+          indicators_avg:[{组,指标,数值}]（全部 28 项指标的队内平均分，非门将）,
+          strength:{attack,defense,gk}（进攻/防守/门将指数，用于赛果预测）}
     """
     starters = starters or []
     got = fetch_players_ability([p.get("id") for p in starters], workers=workers)
 
     players, avgs, gk_radar, gk_name = [], [], {}, ""
-    group_sum = {}
+    group_sum, ind_sum, ind_order = {}, {}, []
     for p in starters:
         ab = got.get(str(p.get("id"))) or {}
         rmap = ab.get("radar_map") or {}
@@ -572,13 +599,20 @@ def fetch_team_ability(starters, team_name="", workers=8):
             avgs.append(ab["avg"])
         if is_gk and rmap:
             gk_radar, gk_name = rmap, p.get("name") or ""
-            continue        # 门将的门前指标单独呈现，不混入球队分组均值
+            continue        # 门将的门前指标单独呈现，不混入球队均值
         for g in ab.get("groups") or []:
             if g.get("组") == "守门":     # 非门将的「守门」项只是占位低分，无参考意义
                 continue
             vals = [i["数值"] for i in g["指标"] if i.get("数值")]
             if vals:
                 group_sum.setdefault(g["组"], []).append(sum(vals) / len(vals))
+            for it in g["指标"]:
+                if it.get("数值"):
+                    key = (g["组"], it["指标"])
+                    if key not in ind_sum:
+                        ind_sum[key] = []
+                        ind_order.append(key)
+                    ind_sum[key].append(it["数值"])
 
     # 球队雷达：非门将球员的 6 维均值
     out_players = [q for q in players if not q.get("is_gk") and q.get("radar")]
@@ -599,20 +633,174 @@ def fetch_team_ability(starters, team_name="", workers=8):
         "covered": covered,
         "total": len(players),
         "groups_avg": {k: round(sum(v) / len(v), 1) for k, v in group_sum.items()},
+        "indicators_avg": [{"组": k[0], "指标": k[1],
+                            "数值": round(sum(v) / len(v), 1)}
+                           for k, v in ((kk, ind_sum[kk]) for kk in ind_order)],
+        "strength": team_strength_index({"radar": {x["name"]: x["val"]
+                                                   for x in radar_list},
+                                         "gk_radar": gk_radar}),
     }
 
 
-def fetch_team_ratings(team_id, limit=6):
+def team_strength_index(ability):
+    """从能力值推出「进攻 / 防守 / 门将」三个指数（0~100），供赛果预测使用。
+
+    · 进攻指数 = 6 维雷达里 射门 / 盘带 / 传球 / 速度 的均值
+    · 防守指数 = 6 维雷达里 防守 / 力量 的均值，再混入 25% 门将指数
+    · 门将指数 = 门将 6 维（扑救/位置/速度/反应/开球/手型）的均值
+    """
+    ab = ability or {}
+    d = ab.get("radar") or {}
+    gk = ab.get("gk_radar") or {}
+
+    def _mean(vs):
+        vs = [v for v in vs if v]
+        return round(sum(vs) / len(vs), 1) if vs else None
+
+    atk = _mean([d.get(k) for k in ("射门", "盘带", "传球", "速度")])
+    dfn = _mean([d.get(k) for k in ("防守", "力量")])
+    gki = _mean(list(gk.values()))
+    if dfn is not None and gki is not None:
+        dfn = round(0.75 * dfn + 0.25 * gki, 1)
+    return {"attack": atk, "defense": dfn, "gk": gki}
+
+
+def fetch_team_form(team_id, limit=10, season=None):
+    """球队近期状态（最近 limit 场已结束比赛）。
+
+    返回 {"played", "w", "d", "l", "gf", "ga", "gf_pg", "ga_pg", "ppg",
+          "win_rate", "matches":[{label,score,competition,start_play,gf,ga,result}]}
+    """
+    sched = [m for m in fetch_team_schedule(team_id, season=season)
+             if m.get("status") == "Played" and m.get("gf") is not None]
+    recent = list(reversed(sched))[:limit]        # 最近的在前
+    w = d = l = gf = ga = 0
+    matches = []
+    for m in recent:
+        a, b = m["gf"], m["ga"]
+        res = "胜" if a > b else ("平" if a == b else "负")
+        w += res == "胜"
+        d += res == "平"
+        l += res == "负"
+        gf += a
+        ga += b
+        matches.append({"label": f"{m['home']} {m['score']} {m['away']}".strip(),
+                        "score": m["score"], "competition": m["competition"],
+                        "start_play": m["start_play"], "gf": a, "ga": b, "result": res})
+    n = len(recent)
+    return {
+        "played": n, "w": w, "d": d, "l": l, "gf": gf, "ga": ga,
+        "gf_pg": round(gf / n, 2) if n else None,
+        "ga_pg": round(ga / n, 2) if n else None,
+        "ppg": round((w * 3 + d) / n, 2) if n else None,
+        "win_rate": round(w / n * 100, 1) if n else None,
+        "matches": matches,
+    }
+
+
+def league_goal_baseline(standings):
+    """联赛基线：每队每场平均进球（用于预测）。"""
+    played = sum((r.get("赛") or 0) for r in (standings or []))
+    goals = sum((r.get("进球") or 0) for r in (standings or []))
+    if not played or not goals:
+        return 1.35
+    return round(goals / played, 3)
+
+
+def _strength_mult(v, lo=0.70, hi=1.45, vmin=58.0, vmax=90.0):
+    """把 0~100 的指数映射成 0.70~1.45 的强度系数（越高越强）。"""
+    if v is None:
+        return 1.0
+    v = max(vmin, min(vmax, float(v)))
+    return lo + (hi - lo) * (v - vmin) / (vmax - vmin)
+
+
+def _pois(k, lam):
+    import math
+    return math.exp(-lam) * lam ** k / math.factorial(k)
+
+
+def poisson_predict(home_ability, home_form, away_ability, away_form,
+                    baseline=1.35, max_goals=8, form_weight=0.4, shrink=0.65):
+    """用「能力值 + 近期状态」混合出攻防强度，再用泊松分布算胜平负与比分概率。
+
+    · 进攻强度 = (1-w)*能力进攻指数系数 + w*近期场均进球相对联赛基线的倍数
+    · 防守强度 = (1-w)*能力防守指数系数 + w*(联赛基线/近期场均失球)  ← 失球越少越强
+    · λ_主 = 基线 * 1.10(主场) * 主攻 / 客防
+      λ_客 = 基线 / 1.10      * 客攻 / 主防
+    近期数据样本小、噪声大，故对「相对均值的偏离」做 shrink 收缩（默认 0.65，
+    即偏离量只取 65%），避免 6 场 2.5 个失球就把期望进球放大到 4 球以上。
+    这是启发性估计，不是官方赔率，仅供参考。
+    """
+    hs = team_strength_index(home_ability)
+    as_ = team_strength_index(away_ability)
+    base = float(baseline or 1.35)
+
+    def _shrunk(m):
+        return 1.0 + shrink * (m - 1.0)
+
+    def atk_mult(st, form):
+        a = _strength_mult(st.get("attack"))
+        f = (form or {}).get("gf_pg")
+        fm = (f / base) if f else None
+        if fm is None:
+            return a
+        fm = _shrunk(max(0.55, min(1.75, fm)))
+        return (1 - form_weight) * a + form_weight * fm
+
+    def def_mult(st, form):
+        d = _strength_mult(st.get("defense"))
+        g = (form or {}).get("ga_pg")
+        fm = (base / g) if g else None
+        if fm is None:
+            return d
+        fm = _shrunk(max(0.55, min(1.75, fm)))
+        return (1 - form_weight) * d + form_weight * fm
+
+    h_atk, h_def = atk_mult(hs, home_form), def_mult(hs, home_form)
+    a_atk, a_def = atk_mult(as_, away_form), def_mult(as_, away_form)
+    lam_h = max(0.15, min(3.6, base * 1.10 * h_atk / max(0.4, a_def)))
+    lam_a = max(0.15, min(3.6, base / 1.10 * a_atk / max(0.4, h_def)))
+
+    n = max_goals + 1
+    grid = [[_pois(i, lam_h) * _pois(j, lam_a) for j in range(n)] for i in range(n)]
+    p_h = sum(grid[i][j] for i in range(n) for j in range(n) if i > j)
+    p_d = sum(grid[i][i] for i in range(n))
+    p_a = sum(grid[i][j] for i in range(n) for j in range(n) if i < j)
+    tot = p_h + p_d + p_a or 1.0
+    scores = sorted(({"score": f"{i}-{j}", "p": grid[i][j] * 100,
+                      "h": i, "a": j}
+                     for i in range(min(6, n)) for j in range(min(6, n))),
+                    key=lambda x: -x["p"])
+    return {
+        "lambda_home": round(lam_h, 2), "lambda_away": round(lam_a, 2),
+        "p_home": round(p_h / tot * 100, 1),
+        "p_draw": round(p_d / tot * 100, 1),
+        "p_away": round(p_a / tot * 100, 1),
+        "top_scores": scores[:6],
+        "grid": [[round(v * 100, 3) for v in row] for row in grid],
+        "expected": f"{lam_h:.1f}-{lam_a:.1f}",
+        "strength": {
+            "home": {**hs, "atk_mult": round(h_atk, 3), "def_mult": round(h_def, 3)},
+            "away": {**as_, "atk_mult": round(a_atk, 3), "def_mult": round(a_def, 3)},
+        },
+        "form_weight": form_weight,
+        "baseline": base,
+    }
+
+
+def fetch_team_ratings(team_id, limit=6, season=None):
     """抓球队最近 limit 场已结束比赛的阵容，汇总每名球员的场均评分。
 
-    team_id 用**网页版原值**（如 1755=皇马 / 513=阿森纳）；阵容里的 team_id 是
-    sport-data 内部 ID，这里用赛程返回的 my_ids 做兼容比对，避免西甲/意甲/中超
-    因为 ID 空间不同而一场都匹配不上（历史 bug，2026-09-18 修）。
+    team_id 用**网页版原值**（如 1755=皇马 / 513=阿森纳）；赛季传 "2025-2026"
+    可查历史赛季。阵容里的 team_id 是 sport-data 内部 ID，这里用赛程返回的
+    my_ids 做兼容比对，避免西甲/意甲/中超因为 ID 空间不同而一场都匹配不上
+    （历史 bug，2026-09-18 修）。
 
     返回 {"matches":[...], "players":[{name,position,matches,avg_rate,best,ratings}],
           "team_avg": float|None}
     """
-    all_sched = fetch_team_schedule(team_id)
+    all_sched = fetch_team_schedule(team_id, season=season)
     my_ids = set(sport_team_id_variants(team_id))
     for m in all_sched:
         my_ids.update(str(x) for x in (m.get("my_ids") or []) if x)
