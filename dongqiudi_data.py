@@ -423,6 +423,151 @@ def fetch_team_profile(team_id):
     }
 
 
+# ---------------------------------------------------------------------------
+# 球员能力值（sofifa / EA FC 数据，与懂球帝球员页「能力」板块同源）
+#   /soccer/data/sofifa/v1/player_ability/{person_id}?app=dqd&lang=zh-cn
+#   → data.average.val    总评（0~99）
+#     data.bar_info[]     分组指标：进攻/技巧/移动/力量/心理/防守/守门，每组 3~5 项
+#     data.redar[]        6 维雷达：非门将=速度/力量/防守/盘带/传球/射门
+#                                     门将  =扑救/位置/速度/反应/开球/手型
+#     data.star_bar[]     国际声望 / 逆足能力 / 花式技巧（1~5 星）
+#     data.fields[]       各位置适配度（含注册位置 best_pos）
+#     data.version        数据版本（如 "FC 26"）
+# ---------------------------------------------------------------------------
+SOFIFA_BASE = "https://sport-data.dongqiudi.com/soccer/data/sofifa/v1"
+
+RADAR_DIMS = ["速度", "力量", "防守", "盘带", "传球", "射门"]        # 非门将 6 维
+GK_DIMS = ["扑救", "位置", "速度", "反应", "开球", "手型"]           # 门将 6 维
+ABILITY_GROUP_ORDER = ["进攻", "技巧", "移动", "力量", "心理", "防守", "守门"]
+
+
+def fetch_player_ability(person_id):
+    """球员能力值。
+
+    返回 {version, avg, groups:[{组,合计,指标:[{指标,数值}]}], radar:[{name,val}],
+          radar_map, dims（按 RADAR_DIMS/GK_DIMS 排好序的名字）, stars, positions,
+          foot, reg_pos, is_gk}；该球员无能力数据时返回 {}。
+    """
+    if not person_id:
+        return {}
+    url = f"{SOFIFA_BASE}/player_ability/{person_id}?app=dqd&lang=zh-cn"
+    req = urllib.request.Request(url, headers=SPORT_HEADERS)
+    with urllib.request.urlopen(req, timeout=20) as r:
+        raw = r.read()
+        if raw[:2] == b"\x1f\x8b":
+            raw = gzip.decompress(raw)
+        d = json.loads(raw.decode("utf-8", "ignore"))
+    data = d.get("data") or {}
+    if not data or not (data.get("average") or {}).get("val"):
+        return {}
+    groups = []
+    for g in data.get("bar_info") or []:
+        items = [{"指标": i.get("name"), "数值": _int(i.get("val"))}
+                 for i in (g.get("detail") or []) if i.get("name")]
+        if items:
+            groups.append({"组": g.get("title") or "", "合计": _int(g.get("total")),
+                           "指标": items})
+    groups.sort(key=lambda x: (ABILITY_GROUP_ORDER.index(x["组"])
+                              if x["组"] in ABILITY_GROUP_ORDER else 99))
+    radar = [{"name": x.get("name"), "val": _int(x.get("val"))}
+             for x in (data.get("redar") or []) if x.get("name")]
+    rmap = {x["name"]: x["val"] for x in radar}
+    is_gk = "扑救" in rmap
+    order = GK_DIMS if is_gk else RADAR_DIMS
+    return {
+        "version": data.get("version") or "",
+        "avg": _int((data.get("average") or {}).get("val")),
+        "groups": groups,
+        "radar": radar,
+        "radar_map": rmap,
+        "dims": [d0 for d0 in order if d0 in rmap],
+        "stars": [{"name": s.get("name"), "val": _int(s.get("val"))}
+                  for s in (data.get("star_bar") or []) if s.get("name")],
+        "positions": sorted([{"name": p.get("name"), "val": _int(p.get("val"))}
+                             for p in (data.get("fields") or []) if p.get("name")],
+                            key=lambda x: -x["val"]),
+        "foot": (data.get("foot_info") or {}).get("val") or "",
+        "reg_pos": (data.get("good_pos") or {}).get("val") or "",
+        "is_gk": is_gk,
+    }
+
+
+def fetch_players_ability(person_ids, workers=8):
+    """并发批量抓取能力值。返回 {person_id(str): ability_dict}（无数据的为空 dict）。"""
+    from concurrent.futures import ThreadPoolExecutor
+    ids = [str(i) for i in (person_ids or []) if i]
+
+    def one(pid):
+        try:
+            return pid, fetch_player_ability(pid)
+        except Exception:  # noqa: BLE001
+            return pid, {}
+
+    out = {}
+    if ids:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            for pid, ab in ex.map(one, ids):
+                out[pid] = ab
+    return out
+
+
+def fetch_team_ability(starters, workers=8):
+    """以首发球员的能力值为基础，算出「球队能力评分」。
+
+    球队能力评分 = 首发 11 人能力值（总评）的平均分（与比赛评分口径一致）。
+    同时给出球队雷达（非门将 6 维均值）与门将雷达。
+
+    返回 {players:[{id,name,position,shirt,rate,avg,radar,is_gk}],
+          team_avg, radar:{维度:值}, radar_list:[{name,val}], gk_radar, gk_name,
+          covered, total, groups_avg:{组:均值}}
+    """
+    starters = starters or []
+    got = fetch_players_ability([p.get("id") for p in starters], workers=workers)
+
+    players, avgs, gk_radar, gk_name = [], [], {}, ""
+    group_sum = {}
+    for p in starters:
+        ab = got.get(str(p.get("id"))) or {}
+        rmap = ab.get("radar_map") or {}
+        is_gk = bool(ab.get("is_gk"))
+        players.append({
+            "id": p.get("id"), "name": p.get("name"), "position": p.get("position"),
+            "shirt": p.get("shirt"), "rate": p.get("rate"),
+            "avg": ab.get("avg"), "radar": rmap, "is_gk": is_gk,
+        })
+        if ab.get("avg"):
+            avgs.append(ab["avg"])
+        if is_gk and rmap:
+            gk_radar, gk_name = rmap, p.get("name") or ""
+            continue        # 门将的门前指标单独呈现，不混入球队分组均值
+        for g in ab.get("groups") or []:
+            if g.get("组") == "守门":     # 非门将的「守门」项只是占位低分，无参考意义
+                continue
+            vals = [i["数值"] for i in g["指标"] if i.get("数值")]
+            if vals:
+                group_sum.setdefault(g["组"], []).append(sum(vals) / len(vals))
+
+    # 球队雷达：非门将球员的 6 维均值
+    out_players = [q for q in players if not q.get("is_gk") and q.get("radar")]
+    radar_list = []
+    for dim in RADAR_DIMS:
+        vs = [q["radar"][dim] for q in out_players if q["radar"].get(dim)]
+        if vs:
+            radar_list.append({"name": dim, "val": round(sum(vs) / len(vs))})
+    covered = len(avgs)
+    return {
+        "players": players,
+        "team_avg": round(sum(avgs) / len(avgs), 1) if avgs else None,
+        "radar": {x["name"]: x["val"] for x in radar_list},
+        "radar_list": radar_list,
+        "gk_radar": gk_radar,
+        "gk_name": gk_name,
+        "covered": covered,
+        "total": len(players),
+        "groups_avg": {k: round(sum(v) / len(v), 1) for k, v in group_sum.items()},
+    }
+
+
 def fetch_team_ratings(team_id, limit=6):
     """抓球队最近 limit 场已结束比赛的阵容，汇总每名球员的场均评分。
 
@@ -458,7 +603,7 @@ def fetch_team_ratings(team_id, limit=6):
         for p in side.get("starters") or []:
             if not p.get("rate"):
                 continue
-            e = agg.setdefault(p["name"], {"name": p["name"],
+            e = agg.setdefault(p["name"], {"name": p["name"], "id": p.get("id"),
                                            "position": p["position"], "ratings": []})
             e["ratings"].append(p["rate"])
     players = []
@@ -467,6 +612,7 @@ def fetch_team_ratings(team_id, limit=6):
         players.append({
             "name": e["name"], "position": e["position"], "matches": len(rs),
             "avg_rate": round(sum(rs) / len(rs), 2), "best": max(rs), "ratings": rs,
+            "id": e.get("id"),
         })
     players.sort(key=lambda x: (-x["matches"], -x["avg_rate"]))
     team_vals = [m["avg_rate"] for m in matches if m.get("avg_rate")]

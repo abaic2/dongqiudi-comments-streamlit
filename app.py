@@ -1093,6 +1093,145 @@ def chart_rating_trend(matches):
     }
 
 
+# ---------------- 能力值（传球 / 身体 / 射门…）相关图表 ----------------
+_AB_COLORS = [_RED, _RED2, "#f2a33c", "#4b7bec", "#8e7cf0", "#2fb886", "#8a94a6"]
+_BLUE = "#4b7bec"
+
+
+def chart_radar(dims, series, maxv=100, height_hint=0):
+    """雷达图。dims: 维度名列表；series: [{"name": str, "data": [数值...]}]。"""
+    return {
+        "color": [_RED, _BLUE, "#f2a33c"],
+        "tooltip": {},
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}} if len(series) > 1 else {"show": False},
+        "radar": {
+            "indicator": [{"name": n, "max": maxv} for n in dims],
+            "radius": "62%", "center": ["50%", "56%"],
+            "axisName": {"color": "#6b7280", "fontSize": 11},
+            "splitArea": {"areaStyle": {"color": ["#ffffff", "#fafbfc"]}},
+            "splitLine": {"lineStyle": {"color": "#e9ebef"}},
+            "axisLine": {"lineStyle": {"color": "#e9ebef"}},
+        },
+        "series": [{
+            "type": "radar",
+            "data": [{"name": s.get("name"), "value": s.get("data"),
+                      "areaStyle": {"opacity": 0.18},
+                      "lineStyle": {"width": 2}, "symbolSize": 5} for s in series],
+        }],
+    }
+
+
+def chart_ability_groups(groups):
+    """能力值分组明细（按「进攻/技巧/移动/力量/心理/防守…」着色，长条横排）。"""
+    cats = [it["指标"] for g in groups for it in g["指标"]]
+    series = []
+    for i, g in enumerate(groups):
+        n = len(g["指标"])
+        start = sum(len(x["指标"]) for x in groups[:i])
+        data = [None] * len(cats)
+        for k, it in enumerate(g["指标"]):
+            data[start + k] = it["数值"]
+        series.append({"name": g["组"], "type": "bar", "data": data,
+                       "itemStyle": {"color": _AB_COLORS[i % len(_AB_COLORS)],
+                                     "borderRadius": [0, 4, 4, 0]},
+                       "label": {"show": True, "position": "right", "fontSize": 10,
+                                 "color": "#6b7280"}})
+    return {
+        "color": _AB_COLORS,
+        "legend": {"top": 0, "textStyle": {"fontSize": 11}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 78, "right": 44, "top": 40, "bottom": 18},
+        "xAxis": {"type": "value", "max": 100, "splitLine": _GRID,
+                  "axisLabel": {"fontSize": 10, "color": "#9ca3af"}},
+        "yAxis": {"type": "category", "data": list(reversed(cats)),
+                  "axisLabel": {"fontSize": 10.5, "color": "#15181d"}},
+        "series": [{**s, "data": list(reversed(s["data"]))} for s in series],
+    }
+
+
+def chart_ability_compare(A, B):
+    """两队首发 11 人「能力值」对比（A/B 为 fetch_team_ability 结果）。"""
+    a = A.get("players") or []
+    b = B.get("players") or []
+
+    def short(q, n=4):
+        s = (q or {}).get("name") or ""
+        return s if len(s) <= n else s[:n]
+
+    n = max(len(a), len(b))
+    return {
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 46, "bottom": 56},
+        "xAxis": {"type": "category",
+                  "data": [f"{(a[i] if i < len(a) else {}).get('position', '')}\n"
+                           f"{short(a[i] if i < len(a) else {})}\n"
+                           f"{short(b[i] if i < len(b) else {})}"
+                           for i in range(n)],
+                  "axisLabel": {"fontSize": 8.5, "lineHeight": 11,
+                                "color": "#6b7280", "interval": 0, "rotate": 0}},
+        "yAxis": {"type": "value", "max": 100, "splitLine": _GRID},
+        "series": [
+            {"name": f"{A.get('name')}（首发能力 {A.get('team_avg')}）", "type": "bar",
+             "data": [q.get("avg") for q in a],
+             "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]}},
+            {"name": f"{B.get('name')}（首发能力 {B.get('team_avg')}）", "type": "bar",
+             "data": [q.get("avg") for q in b],
+             "itemStyle": {"color": _BLUE, "borderRadius": [3, 3, 0, 0]}},
+        ],
+    }
+
+
+def chart_ability_rank(items, top=15):
+    """球员能力值（总评）横向柱。items: [{"name","avg"}]。"""
+    d = list(reversed([x for x in items if x.get("avg")][:top]))
+    return {
+        "grid": {"left": 92, "right": 46, "top": 16, "bottom": 24},
+        "tooltip": {"trigger": "axis"},
+        "xAxis": {"type": "value", "min": 50, "max": 100, "splitLine": _GRID},
+        "yAxis": {"type": "category", "data": [p["name"] for p in d],
+                  "axisLabel": {"fontSize": 11, "color": "#15181d"}},
+        "series": [{"type": "bar", "name": "能力值", "data": [p["avg"] for p in d],
+                    "itemStyle": {"color": _RED2, "borderRadius": [0, 4, 4, 0]},
+                    "label": {"show": True, "position": "right", "fontSize": 10,
+                              "color": "#6b7280"}}],
+    }
+
+
+def chart_ability_vs_rate(sides):
+    """能力值 vs 本场评分 散点（sides: [{"name","players"}]）。
+
+    落在右上=能力强且发挥好；左上=能力强但没发挥；右下=发挥超水平。
+    """
+    series = []
+    for i, sd in enumerate(sides):
+        pts = [[q.get("avg"), q.get("rate"), q.get("name")]
+               for q in (sd.get("players") or []) if q.get("avg") and q.get("rate")]
+        series.append({
+            "name": sd.get("name"), "type": "scatter",
+            "data": [{"value": [p[0], p[1]], "name": p[2]} for p in pts],
+            "symbolSize": 11,
+            "itemStyle": {"color": _RED if i == 0 else _BLUE, "opacity": .85},
+            "label": {"show": True, "position": "top", "fontSize": 9,
+                      "color": "#6b7280", "formatter": "{b}"},
+            "labelLayout": {"hideOverlap": True},
+        })
+    return {
+        "color": [_RED, _BLUE],
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "item",
+                    "formatter": "{b}：能力 {c0} ／ 本场评分 {c1}"},
+        "grid": {"left": 52, "right": 26, "top": 44, "bottom": 46},
+        "xAxis": {"type": "value", "name": "能力值", "min": 60, "max": 95,
+                  "nameTextStyle": {"fontSize": 11, "color": "#9ca3af"},
+                  "splitLine": _GRID, "axisLabel": {"fontSize": 10, "color": "#9ca3af"}},
+        "yAxis": {"type": "value", "name": "本场评分", "min": 5, "max": 10,
+                  "nameTextStyle": {"fontSize": 11, "color": "#9ca3af"},
+                  "splitLine": _GRID, "axisLabel": {"fontSize": 10, "color": "#9ca3af"}},
+        "series": [s for s in series if s["data"]],
+    }
+
+
 # ------------------------- UI（仅在 streamlit 运行时执行） -------------------
 def main():
     st.set_page_config(page_title="懂球帝 · 评论爬取 + 数据分析", page_icon="⚽", layout="wide")
@@ -1482,7 +1621,7 @@ def page_data():
     ]), unsafe_allow_html=True)
 
     t1, t2, t_rt, t_pr, t3, t4, t5 = st.tabs([
-        "📋 积分榜", "⚽ 射手榜", "🎯 阵容与评分", "📈 球员评分榜",
+        "📋 积分榜", "⚽ 射手榜", "🎯 阵容 · 评分与能力", "📈 球员评分 · 能力榜",
         "⚖️ 球队对比", "🏟️ 球队详情", "👤 球员详情"])
 
     # ---------- 1) 积分榜 ----------
@@ -1532,8 +1671,9 @@ def page_data():
         if not teams_sd:
             st.info("暂无球队 ID，无法加载阵容与评分。")
         else:
-            st.caption("球队评分 = 该场**首发 11 人评分的平均分**（懂球帝官网评分口径）；"
-                       "评分来自比赛阵容接口（首发 11 人）。")
+            st.caption("**球队评分口径**：以首发 11 人的**能力值**（FC 系列数据，含传球 / 身体 / "
+                       "射门等各项指标）为基础，取 11 人**总评的平均分**；同时给出该场**首发 11 人"
+                       "比赛评分的平均分**作为对照。")
             tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rating_team")
             tid = dict(teams_sd)[tn]
             try:
@@ -1561,26 +1701,88 @@ def page_data():
                     lu = {}
                 A, B = lu.get("A"), lu.get("B")
                 if A and B:
+                    # ---- 以首发 11 人能力值为基础的球队评分 ----
+                    try:
+                        with st.spinner("正在加载首发 11 人能力值（传球 / 身体 / 射门…）…"):
+                            abA = _cached(f"ab_{mid}_A", DD.fetch_team_ability, A["starters"])
+                            abB = _cached(f"ab_{mid}_B", DD.fetch_team_ability, B["starters"])
+                    except Exception as e:  # noqa: BLE001
+                        st.warning(f"能力值加载失败（其余功能不受影响）：{type(e).__name__}: {e}")
+                        abA, abB = {"players": []}, {"players": []}
+
                     st.markdown(render_stat_tiles([
+                        (abA.get("team_avg") or "—", f"{A.get('name')} 球队能力评分", "red"),
+                        (abB.get("team_avg") or "—", f"{B.get('name')} 球队能力评分", ""),
                         (A.get("avg_rate") or "—", f"{A.get('name')} 首发评分", "red"),
                         (B.get("avg_rate") or "—", f"{B.get('name')} 首发评分", ""),
-                        (A.get("formation") or "—", f"{A.get('name')} 阵型", ""),
-                        (f"{A.get('market_value') or '—'} / {B.get('market_value') or '—'}",
-                         "身价对比", ""),
                     ]), unsafe_allow_html=True)
+                    st.caption(f"能力评分 = 首发 11 人能力值总评的平均分，基于 FC 系列数据"
+                               f"（{abA.get('covered', 0)}/{abA.get('total', 0)} 人与 "
+                               f"{abB.get('covered', 0)}/{abB.get('total', 0)} 人有能力数据）。")
+
+                    # ---- 球队能力雷达对比 + 门将雷达 ----
+                    rA = abA.get("radar_list") or []
+                    rB = abB.get("radar_list") or []
+                    if rA or rB:
+                        cc_ra, cc_rb = st.columns([1.15, 1], gap="large")
+                        with cc_ra:
+                            with st.container(border=True, key="dt_p_ability_radar"):
+                                st.markdown(render_h("两队首发能力雷达对比（非门将 6 维均值）"),
+                                            unsafe_allow_html=True)
+                                dims = [x["name"] for x in (rA or rB)]
+                                echarts(chart_radar(dims, [
+                                    {"name": A.get("name"),
+                                     "data": [(abA.get("radar") or {}).get(d) for d in dims]},
+                                    {"name": B.get("name"),
+                                     "data": [(abB.get("radar") or {}).get(d) for d in dims]},
+                                ]), 380)
+                        with cc_rb:
+                            with st.container(border=True, key="dt_p_gk_radar"):
+                                g1, g2 = abA.get("gk_radar") or {}, abB.get("gk_radar") or {}
+                                gk_dims = list(g1.keys()) or list(g2.keys())
+                                if gk_dims:
+                                    st.markdown(render_h("门将能力对比"),
+                                                unsafe_allow_html=True)
+                                    echarts(chart_radar(gk_dims, [
+                                        {"name": f"{A.get('name')} · {abA.get('gk_name') or '门将'}",
+                                         "data": [g1.get(d) for d in gk_dims]},
+                                        {"name": f"{B.get('name')} · {abB.get('gk_name') or '门将'}",
+                                         "data": [g2.get(d) for d in gk_dims]},
+                                    ]), 380)
+                                else:
+                                    st.markdown(render_h("门将能力对比"), unsafe_allow_html=True)
+                                    st.caption("该场门将能力数据缺失。")
+
                     with st.container(border=True, key="dt_p_lineup_chart"):
-                        st.markdown(render_h("两队首发 11 人评分对比"), unsafe_allow_html=True)
+                        st.markdown(render_h("两队首发 11 人比赛评分对比"), unsafe_allow_html=True)
                         echarts(chart_lineup_compare(A, B), 380)
+
+                    with st.container(border=True, key="dt_p_ability_chart"):
+                        st.markdown(render_h("两队首发 11 人能力值对比"), unsafe_allow_html=True)
+                        echarts(chart_ability_compare(abA, abB), 400)
+
+                    with st.container(border=True, key="dt_p_ability_scatter"):
+                        st.markdown(render_h("能力值 × 本场评分（谁没发挥出来？）"),
+                                    unsafe_allow_html=True)
+                        st.caption("右上＝能力强且发挥好；**左上＝能力强但本场没发挥**；右下＝超水平发挥。")
+                        echarts(chart_ability_vs_rate([
+                            {"name": A.get("name"), "players": abA.get("players") or []},
+                            {"name": B.get("name"), "players": abB.get("players") or []},
+                        ]), 420)
+
                     cA, cB = st.columns(2, gap="large")
-                    for col, t in ((cA, A), (cB, B)):
+                    for col, t, ab in ((cA, A, abA), (cB, B, abB)):
                         with col:
                             with st.container(border=True, key=f"dt_p_side_{t.get('team_id')}"):
                                 st.markdown(render_h(
-                                    f"{t['name']} · 首发 11 人（均分 {t['avg_rate']}）"),
-                                    unsafe_allow_html=True)
+                                    f"{t['name']} · 首发 11 人（能力 {ab.get('team_avg')} ／ "
+                                    f"评分 {t['avg_rate']}）"), unsafe_allow_html=True)
+                                amap = {q.get("name"): q for q in (ab.get("players") or [])}
                                 df = pd.DataFrame([{
                                     "号码": p["shirt"], "位置": p["position"], "球员": p["name"],
-                                    "评分": p["rate"], "队长": "✓" if p["captain"] else "",
+                                    "能力值": (amap.get(p["name"]) or {}).get("avg"),
+                                    "本场评分": p["rate"],
+                                    "队长": "✓" if p["captain"] else "",
                                     "MVP": "★" if p["mvp"] else "",
                                 } for p in t["starters"]])
                                 st.dataframe(df, width="stretch", hide_index=True, height=430)
@@ -1590,6 +1792,79 @@ def page_data():
                         b = lu["base"]
                         st.caption(f"场地：{b.get('field') or '—'}　·　天气："
                                    f"{b.get('weather') or '—'}　·　主裁：{b.get('referee') or '—'}")
+
+                    # ---- 分组能力均值对比（进攻/技巧/移动/力量/心理/防守）----
+                    ga, gb = abA.get("groups_avg") or {}, abB.get("groups_avg") or {}
+                    if ga or gb:
+                        with st.container(border=True, key="dt_p_ability_group"):
+                            st.markdown(render_h("两队能力分组均值对比"), unsafe_allow_html=True)
+                            gdims = [g for g in DD.ABILITY_GROUP_ORDER
+                                     if g in ga or g in gb]
+                            echarts({
+                                "color": [_RED, _BLUE],
+                                "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+                                "tooltip": {"trigger": "axis"},
+                                "grid": {"left": 46, "right": 18, "top": 44, "bottom": 30},
+                                "xAxis": {"type": "category", "data": gdims,
+                                          "axisLabel": {"fontSize": 11, "color": "#6b7280"}},
+                                "yAxis": {"type": "value", "max": 100, "splitLine": _GRID},
+                                "series": [
+                                    {"name": A.get("name"), "type": "bar",
+                                     "data": [ga.get(g) for g in gdims],
+                                     "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]},
+                                     "label": {"show": True, "position": "top",
+                                               "fontSize": 10, "color": "#6b7280"}},
+                                    {"name": B.get("name"), "type": "bar",
+                                     "data": [gb.get(g) for g in gdims],
+                                     "itemStyle": {"color": _BLUE, "borderRadius": [3, 3, 0, 0]},
+                                     "label": {"show": True, "position": "top",
+                                               "fontSize": 10, "color": "#6b7280"}},
+                                ],
+                            }, 360)
+                            st.caption("分组均值取该队**非门将首发**在该组各项指标的平均分"
+                                       "（门将的门前指标另见图）。")
+
+                    # ---- 单名球员的能力明细 ----
+                    allp = {q.get("name"): q for q in (abA.get("players") or [])
+                            + (abB.get("players") or []) if q.get("avg")}
+                    if allp:
+                        with st.container(border=True, key="dt_p_ability_one"):
+                            st.markdown(render_h("单名球员能力明细（传球 / 身体 / 射门…）"),
+                                        unsafe_allow_html=True)
+                            who = st.selectbox("选择球员", sorted(allp.keys()),
+                                               key="dt_ability_player")
+                            pid = allp[who].get("id")
+                            one = _cached(f"abp_{pid}", DD.fetch_player_ability, pid)
+                            if not one:
+                                st.info("该球员暂无能力值数据。")
+                            else:
+                                st.markdown(render_stat_tiles([
+                                    (one.get("avg"), f"{who} 能力总评", "red"),
+                                    (one.get("version") or "—", "数据版本", ""),
+                                    (one.get("reg_pos") or "—", "注册位置", ""),
+                                    (one.get("foot") or "—", "惯用脚", ""),
+                                ]), unsafe_allow_html=True)
+                                o1, o2 = st.columns([1, 1.25], gap="large")
+                                with o1:
+                                    echarts(chart_radar(one.get("dims") or [], [
+                                        {"name": who, "data": [one["radar_map"].get(d)
+                                                               for d in (one.get("dims") or [])]}
+                                    ]), 620)
+                                with o2:
+                                    echarts(chart_ability_groups(one.get("groups") or []), 620)
+                                st.dataframe(pd.DataFrame([{
+                                    "组": g["组"], "指标": it["指标"], "数值": it["数值"],
+                                } for g in (one.get("groups") or []) for it in g["指标"]]),
+                                    width="stretch", hide_index=True, height=300)
+                                cap = []
+                                if one.get("stars"):
+                                    cap.append("星级：" + "　".join(
+                                        f"{s['name']} {'★' * s['val']}" for s in one["stars"]))
+                                if one.get("positions"):
+                                    cap.append("位置适配：" + "　".join(
+                                        f"{p['name']} {p['val']}" for p in one["positions"][:6]))
+                                if cap:
+                                    st.caption("　·　".join(cap))
                 else:
                     st.info("该场暂无阵容评分数据（可能未开赛或数据未生成）。")
 
@@ -1616,11 +1891,23 @@ def page_data():
             if not players:
                 st.info("暂无可汇总的评分数据。")
             else:
+                try:
+                    with st.spinner("正在加载球员能力值…"):
+                        abmap = _cached(f"ablist_{tid}_{n}",
+                                        DD.fetch_players_ability,
+                                        [p.get("id") for p in players])
+                except Exception:  # noqa: BLE001
+                    abmap = {}
+                for p in players:
+                    p["ability"] = (abmap.get(str(p.get("id"))) or {}).get("avg")
+                with_ab = [p for p in players if p.get("ability")]
+                team_ability = (round(sum(p["ability"] for p in with_ab) / len(with_ab), 1)
+                                if with_ab else None)
                 st.markdown(render_stat_tiles([
                     (rk.get("team_avg") or "—", f"{tn} 场均首发评分", "red"),
+                    (team_ability or "—", f"{tn} 球员能力均值", "red"),
                     (len(matches), "统计场次", ""),
                     (len(players), "涉及球员", ""),
-                    (players[0]["name"], "场均最高", ""),
                 ]), unsafe_allow_html=True)
                 cc3, cc4 = st.columns([1.2, 1], gap="large")
                 with cc3:
@@ -1631,13 +1918,56 @@ def page_data():
                     with st.container(border=True, key="dt_p_pr_trend"):
                         st.markdown(render_h("球队首发均分走势"), unsafe_allow_html=True)
                         echarts(chart_rating_trend(matches), 430)
+                if with_ab:
+                    cc5, cc6 = st.columns([1, 1], gap="large")
+                    with cc5:
+                        with st.container(border=True, key="dt_p_pr_ability"):
+                            st.markdown(render_h("球员能力值 Top 15（传球 / 身体 / 射门…）"),
+                                        unsafe_allow_html=True)
+                            echarts(chart_ability_rank(
+                                [{"name": p["name"], "avg": p["ability"]} for p in players],
+                                15), 430)
+                    with cc6:
+                        with st.container(border=True, key="dt_p_pr_summary"):
+                            st.markdown(render_h("球队能力结构（按指标组）"),
+                                        unsafe_allow_html=True)
+                            gsum = {}
+                            for p in with_ab:
+                                ab = abmap.get(str(p.get("id"))) or {}
+                                if ab.get("is_gk"):
+                                    continue
+                                for g in ab.get("groups") or []:
+                                    if g.get("组") == "守门":
+                                        continue
+                                    vals = [i["数值"] for i in g["指标"] if i.get("数值")]
+                                    if vals:
+                                        gsum.setdefault(g["组"], []).append(
+                                            sum(vals) / len(vals))
+                            gdims = [g for g in DD.ABILITY_GROUP_ORDER if g in gsum]
+                            if gdims:
+                                echarts({
+                                    "tooltip": {"trigger": "axis"},
+                                    "grid": {"left": 46, "right": 18, "top": 24, "bottom": 30},
+                                    "xAxis": {"type": "category", "data": gdims,
+                                              "axisLabel": {"fontSize": 11, "color": "#6b7280"}},
+                                    "yAxis": {"type": "value", "max": 100, "splitLine": _GRID},
+                                    "series": [{
+                                        "type": "bar", "name": "分组均值",
+                                        "data": [round(sum(gsum[g]) / len(gsum[g]), 1)
+                                                 for g in gdims],
+                                        "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]},
+                                        "label": {"show": True, "position": "top",
+                                                  "fontSize": 10, "color": "#6b7280"}}],
+                                }, 430)
+                            else:
+                                st.caption("暂无可汇总的分组能力数据。")
                 with st.container(border=True, key="dt_p_pr_table"):
-                    st.markdown(render_h("球员场均评分明细（按场均降序）"), unsafe_allow_html=True)
+                    st.markdown(render_h("球员场均评分 / 能力值明细"), unsafe_allow_html=True)
                     st.dataframe(pd.DataFrame([{
                         "球员": p["name"], "位置": p["position"], "出场": p["matches"],
-                        "场均评分": p["avg_rate"], "最高": p["best"],
+                        "能力值": p.get("ability"), "场均评分": p["avg_rate"], "最高": p["best"],
                         "各场评分": " / ".join(str(x) for x in p["ratings"]),
-                    } for p in sorted(players, key=lambda x: -x["avg_rate"])]),
+                    } for p in sorted(players, key=lambda x: -(x.get("ability") or 0))]),
                         width="stretch", hide_index=True, height=420)
                 with st.container(border=True, key="dt_p_pr_matches"):
                     st.markdown(render_h("统计到的比赛"), unsafe_allow_html=True)
@@ -1722,12 +2052,58 @@ def page_data():
                 st.error(f"球员数据加载失败：{type(e).__name__}: {e}")
                 return
             meta = info.get("info") or {}
+            try:
+                with st.spinner("正在加载能力值…"):
+                    ab = _cached(f"abp2_{sel['player_id']}", DD.fetch_player_ability,
+                                 sel["player_id"])
+            except Exception:  # noqa: BLE001
+                ab = {}
             st.markdown(render_stat_tiles([
-                (sel["球员"], "球员", "red"),
+                (ab.get("avg") or "—", f"{sel['球员']} 能力总评", "red"),
                 (sel["球队"], "效力球队", ""),
                 (meta.get("身价", "—"), "身价", ""),
-                (meta.get("国籍", "—"), "国籍", ""),
+                (ab.get("version") or meta.get("国籍", "—"), "数据版本 / 国籍", ""),
             ]), unsafe_allow_html=True)
+
+            # ---- 能力值：雷达 + 分组指标（传球 / 身体 / 射门…）----
+            if ab:
+                o1, o2 = st.columns([1, 1.25], gap="large")
+                with o1:
+                    with st.container(border=True, key="dt_p_pl_radar"):
+                        st.markdown(render_h(f"{sel['球员']} · 能力雷达"),
+                                    unsafe_allow_html=True)
+                        dims = ab.get("dims") or []
+                        echarts(chart_radar(dims, [
+                            {"name": sel["球员"],
+                             "data": [ab["radar_map"].get(d) for d in dims]}
+                        ]), 620)
+                        st.caption(f"注册位置：{ab.get('reg_pos') or '—'}　·　惯用脚："
+                                   f"{ab.get('foot') or '—'}　·　数据版本："
+                                   f"{ab.get('version') or '—'}")
+                with o2:
+                    with st.container(border=True, key="dt_p_pl_groups"):
+                        st.markdown(render_h("各项指标（进攻 / 技巧 / 移动 / 力量 / 心理 / 防守…）"),
+                                    unsafe_allow_html=True)
+                        echarts(chart_ability_groups(ab.get("groups") or []), 620)
+                with st.container(border=True, key="dt_p_pl_abtable"):
+                    st.markdown(render_h("能力指标明细（按组）"), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame([{
+                        "组": g["组"], "合计": g["合计"],
+                        "指标": it["指标"], "数值": it["数值"],
+                    } for g in (ab.get("groups") or []) for it in g["指标"]]),
+                        width="stretch", hide_index=True, height=320)
+                cap = []
+                if ab.get("stars"):
+                    cap.append("星级：" + "　".join(
+                        f"{s['name']} {'★' * s['val']}" for s in ab["stars"]))
+                if ab.get("positions"):
+                    cap.append("位置适配：" + "　".join(
+                        f"{p['name']} {p['val']}" for p in ab["positions"][:8]))
+                if cap:
+                    st.caption("　·　".join(cap))
+            else:
+                st.info("该球员暂无能力值数据（FC 系列数据未覆盖）。")
+
             seasons = info.get("seasons") or []
             matches = info.get("matches") or []
             if seasons:
