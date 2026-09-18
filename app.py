@@ -517,6 +517,24 @@ def esc(s):
             .replace('"', "&quot;"))
 
 
+def render_h(title):
+    """板块标题（配合 st.container(border=True) 使用的首行标题）。"""
+    return f'<div class="dqd-h">{title}</div>'
+
+
+def render_sent_chips(avg, pos, neu, neg):
+    """情感概览小卡（平均分 + 三档计数）。"""
+    def chip(v, k, cls=""):
+        c = f" {cls}" if cls else ""
+        return f'<div class="dqd-chip{c}"><div class="v">{v}</div><div class="k">{k}</div></div>'
+    return ('<div class="dqd-chips">'
+            + chip(f"{avg:.2f}", "平均情感分")
+            + chip(str(pos), "正面", "pos")
+            + chip(str(neu), "中性", "neu")
+            + chip(str(neg), "负面", "neg")
+            + '</div>')
+
+
 def render_hero():
     return """
     <div class="dqd-hero">
@@ -597,7 +615,6 @@ def render_hot(comments, topn=8):
 def main():
     st.set_page_config(page_title="懂球帝评论爬取 Demo", page_icon="⚽", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
-    st.markdown(render_hero(), unsafe_allow_html=True)
 
     # ---- session state ----
     for key in ("news", "selected", "sel_title", "results"):
@@ -605,55 +622,70 @@ def main():
             st.session_state[key] = (None if key in ("news", "selected") else
                                      ("" if key == "sel_title" else {}))
 
-    # ---- 加载新闻列表（首次自动拉取真实新闻） ----
+    # 支持 ?sel=<文章ID> 直接打开某篇的分析（可分享链接）
+    _qp_sel = st.query_params.get("sel")
+    if _qp_sel and not st.session_state.selected:
+        st.session_state.selected = str(_qp_sel)
+
+    st.markdown(render_hero(), unsafe_allow_html=True)
+
+    # ---- 首次自动拉取真实新闻 ----
     if st.session_state.news is None:
         with st.spinner("正在获取懂球帝实时新闻…"):
             st.session_state.news = fetch_news_list()
 
-    col_refresh, _ = st.columns([1, 3])
-    with col_refresh:
-        if st.button("🔄 刷新实时新闻", use_container_width=True, type="primary"):
+    # ---- 工具栏：刷新按钮（左） + 状态提示（右） ----
+    c_btn, c_status = st.columns([1, 4], gap="medium")
+    with c_btn:
+        if st.button("🔄 刷新实时新闻", width="stretch", type="primary"):
             with st.spinner("正在重新获取懂球帝实时新闻…"):
                 st.session_state.news = fetch_news_list()
                 st.session_state.selected = None
                 st.session_state.results = {}
                 st.rerun()
-
     news, is_demo_news = st.session_state.news
-    if is_demo_news:
-        st.warning("⚠️ 当前为内置示例新闻（未能联网获取实时列表），评论数据也会是演示数据。", icon="⚠️")
-    else:
-        st.success("✅ 已加载懂球帝实时新闻列表，直接点选卡片即可爬取评论。", icon="✅")
+    with c_status:
+        if is_demo_news:
+            st.warning("⚠️ 未能联网获取实时新闻，当前为内置示例新闻。", icon="⚠️")
+        else:
+            st.success(f"✅ 已加载 {len(news)} 条懂球帝实时新闻，点选卡片即可爬取评论。", icon="✅")
 
-    st.markdown('<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论</div>', unsafe_allow_html=True)
-    cols = st.columns(3)
+    # ---- 新闻网格（3 列卡片） ----
+    st.markdown('<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论</div>',
+                unsafe_allow_html=True)
+    cols = st.columns(3, gap="medium")
     for i, art in enumerate(news):
         with cols[i % 3]:
-            with st.container(border=True):
+            with st.container(border=True, key=f"card_{art['id']}"):
                 if art.get("cover"):
                     try:
-                        st.image(art["cover"], use_column_width=True)
+                        st.image(art["cover"], width="stretch")
                     except Exception:  # noqa: BLE001
                         st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
                 else:
                     st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
-                st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>', unsafe_allow_html=True)
+                st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>',
+                            unsafe_allow_html=True)
                 meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
-                st.caption(meta or "懂球帝")
-                if st.button("📥 爬取评论", key=f"btn_{art['id']}", use_container_width=True):
+                st.markdown(f'<div class="dqd-meta">{esc(meta or "懂球帝")}</div>',
+                            unsafe_allow_html=True)
+                if st.button("📥 爬取评论", key=f"btn_{art['id']}", width="stretch"):
                     st.session_state.selected = art["id"]
                     st.session_state.sel_title = art["title"]
 
-    # ---- 已选新闻的结果展示 ----
+    # ---- 未选择新闻时的引导 ----
     sel = st.session_state.selected
     if not sel:
+        st.markdown('<div class="dqd-hint">👆 点击上方任意新闻卡片的「爬取评论」，'
+                    '即可抓取该文评论并生成词云与情感分析</div>', unsafe_allow_html=True)
         st.stop()
 
+    # ---- 已选新闻标题 ----
     st.markdown(f'<div class="dqd-sel-title">📰 {esc(st.session_state.get("sel_title", ""))}</div>',
                 unsafe_allow_html=True)
 
     if sel not in st.session_state.results:
-        with st.spinner("正在爬取评论（文章页 → 网页接口 → App 接口 → 示例兜底）…"):
+        with st.spinner("正在爬取评论（文章页 → 网页接口 → App 接口）…"):
             res, demo = fetch_or_sample(sel)
             st.session_state.results[sel] = (res, demo)
     res, demo = st.session_state.results[sel]
@@ -677,7 +709,7 @@ def main():
     elif total == 0:
         st.info("该文章当前没有评论（或评论已关闭），换一篇试试～")
 
-    # ---- 概览指标 ----
+    # ---- 概览磁贴 ----
     times = [t for t in (parse_time(c.get("created_at")) for c in comments) if t]
     earliest = min(times).strftime("%m-%d %H:%M") if times else "—"
     latest = max(times).strftime("%m-%d %H:%M") if times else "—"
@@ -688,139 +720,196 @@ def main():
         (latest, "最新评论", ""),
     ]), unsafe_allow_html=True)
 
-    # ---- 词云 ----
-    st.markdown('<div class="dqd-panel"><h3>☁️ 评论词云</h3>', unsafe_allow_html=True)
-    top = build_word_freq(comments)
-    st.markdown(render_wordcloud(top), unsafe_allow_html=True)
-    note = ("（基于 jieba 中文分词统计词频，按频率渲染字号）" if HAVE_JIEBA
-            else "（未安装 jieba，已用正则提取中文词；pip install jieba 可获得更准的分词）")
-    st.caption(note)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # ---- 第一行：词云 ｜ 情感分析 ----
+    a1, a2 = st.columns(2, gap="large")
+    with a1:
+        with st.container(border=True, key="panel_wordcloud"):
+            st.markdown(render_h("☁️ 评论词云"), unsafe_allow_html=True)
+            top = build_word_freq(comments)
+            st.markdown(render_wordcloud(top), unsafe_allow_html=True)
+            note = ("基于 jieba 中文分词统计词频，按频率渲染字号" if HAVE_JIEBA
+                    else "未安装 jieba，已用正则提取中文词；pip install jieba 可获得更准的分词")
+            st.markdown(f'<div class="dqd-note">（{esc(note)}）</div>', unsafe_allow_html=True)
 
-    # ---- 情感分析 ----
-    st.markdown('<div class="dqd-panel"><h3>💡 情感分析</h3>', unsafe_allow_html=True)
-    scored = [sentiment_score(c.get("content", "")) for c in comments]
-    if scored:
-        avg = sum(scored) / len(scored)
-        pos = sum(1 for s in scored if s >= 0.6)
-        neg = sum(1 for s in scored if s <= 0.4)
-        neu = len(scored) - pos - neg
-        st.markdown(render_stat_tiles([
-            (f"{avg:.2f}", "平均情感分", ""),
-            (f"{pos}（{pos / len(scored) * 100:.0f}%）", "正面", ""),
-            (f"{neu}（{neu / len(scored) * 100:.0f}%）", "中性", ""),
-            (f"{neg}（{neg / len(scored) * 100:.0f}%）", "负面", ""),
-        ]), unsafe_allow_html=True)
-        st.markdown(render_sentiment_bar(pos, neu, neg, len(scored)), unsafe_allow_html=True)
+    with a2:
+        with st.container(border=True, key="panel_sent"):
+            st.markdown(render_h("💡 情感分析"), unsafe_allow_html=True)
+            scored = [sentiment_score(c.get("content", "")) for c in comments]
+            if scored:
+                avg = sum(scored) / len(scored)
+                pos = sum(1 for s in scored if s >= 0.6)
+                neg = sum(1 for s in scored if s <= 0.4)
+                neu = len(scored) - pos - neg
+                st.markdown(render_sent_chips(avg, pos, neu, neg), unsafe_allow_html=True)
+                st.markdown(render_sentiment_bar(pos, neu, neg, len(scored)),
+                            unsafe_allow_html=True)
 
-        # 5 档细分：避免只用「正面/中性/负面」三档一笔带过
-        lv = {}
-        for s in scored:
-            k = classify(s)
-            lv[k] = lv.get(k, 0) + 1
-        st.caption("细分档位：" + "　".join(
-            f"{k} {lv.get(k, 0)}（{lv.get(k, 0) / len(scored) * 100:.0f}%）"
-            for k in ["强正面", "正面", "中性", "负面", "强负面"]
-        ))
+                # 5 档细分：避免只用「正面/中性/负面」三档一笔带过
+                lv = {}
+                for s in scored:
+                    k = classify(s)
+                    lv[k] = lv.get(k, 0) + 1
+                st.markdown(
+                    '<div class="dqd-note">细分档位：' + "　".join(
+                        f"{k} {lv.get(k, 0)}（{lv.get(k, 0) / len(scored) * 100:.0f}%）"
+                        for k in ["强正面", "正面", "中性", "负面", "强负面"]
+                    ) + '</div>', unsafe_allow_html=True)
 
-        label = ("整体偏正面 😊" if avg >= 0.6 else
-                 "整体偏负面 😟" if avg <= 0.4 else "整体中性 😐")
-        st.success(f"情感倾向：{label}（情感分基于{'SnowNLP' if HAVE_SNOWNLP else '内置词典'}的启发式估计，仅供参考）")
-    else:
-        st.caption("没有可供分析的评论文本。")
-    st.markdown("</div>", unsafe_allow_html=True)
+                label = ("整体偏正面 😊" if avg >= 0.6 else
+                         "整体偏负面 😟" if avg <= 0.4 else "整体中性 😐")
+                src = "SnowNLP" if HAVE_SNOWNLP else "内置词典"
+                st.markdown(
+                    f'<div class="dqd-verdict">情感倾向：{label}'
+                    f'<span class="src">（基于{src}的启发式估计，仅供参考）</span></div>',
+                    unsafe_allow_html=True)
+            else:
+                st.caption("没有可供分析的评论文本。")
 
-    # ---- 表情 / 表态 Top ----
+    # ---- 第二行：表情 Top10 ｜ 热门评论 ----
     agg = aggregate_emoji(comments)
-    st.markdown('<div class="dqd-panel"><h3>🔥 表情 / 表态 Top 10</h3>', unsafe_allow_html=True)
-    st.markdown(render_emoji_bars(agg, 10), unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    b1, b2 = st.columns(2, gap="large")
+    with b1:
+        with st.container(border=True, key="panel_emoji"):
+            st.markdown(render_h("🔥 表情 / 表态 Top 10"), unsafe_allow_html=True)
+            st.markdown(render_emoji_bars(agg, 10), unsafe_allow_html=True)
+    with b2:
+        with st.container(border=True, key="panel_hot"):
+            st.markdown(render_h("💬 热门评论 · 按点赞排序"), unsafe_allow_html=True)
+            st.markdown(render_hot(comments, 6), unsafe_allow_html=True)
 
-    # ---- 热门评论 ----
-    st.markdown('<div class="dqd-panel"><h3>💬 热门评论（按点赞排序）</h3>', unsafe_allow_html=True)
-    st.markdown(render_hot(comments, 8), unsafe_allow_html=True)
-    st.markdown("</div>", unsafe_allow_html=True)
+    # ---- 第三行：全部评论（整行） ----
+    with st.container(border=True, key="panel_all"):
+        st.markdown(render_h("📋 全部评论"), unsafe_allow_html=True)
+        rows = build_rows(comments)
+        df = pd.DataFrame(rows)
+        if df.empty:
+            st.caption("暂无评论数据。")
+        else:
+            max_items = st.slider("列表展示条数", 10, 300, 60, key="maxitems")
+            st.dataframe(df.head(max_items), width="stretch", height=420)
+            st.download_button(
+                "⬇️ 下载 CSV",
+                df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"dongqiudi_{res['article_id']}.csv",
+                mime="text/csv",
+            )
 
-    # ---- 全部评论表格 + 下载 ----
-    st.markdown('<div class="dqd-panel"><h3>📋 全部评论</h3>', unsafe_allow_html=True)
-    rows = build_rows(comments)
-    df = pd.DataFrame(rows)
-    max_items = st.slider("列表展示条数", 10, 300, 60, key="maxitems")
-    if not df.empty:
-        st.dataframe(df.head(max_items), use_container_width=True, height=420)
-        csv = df.to_csv(index=False).encode("utf-8-sig")
-        st.download_button(
-            "⬇️ 下载 CSV",
-            csv,
-            file_name=f"dongqiudi_{res['article_id']}.csv",
-            mime="text/csv",
-        )
-    st.markdown("</div>", unsafe_allow_html=True)
+    st.markdown('<div class="dqd-foot">数据来自懂球帝公开页面，仅供学习研究使用。</div>',
+                unsafe_allow_html=True)
 
 
 PLACEHOLDER_COVER = (
-    '<div style="height:120px;background:linear-gradient(135deg,#d51d2a,#ff6a3d);'
-    'border-radius:8px;display:flex;align-items:center;justify-content:center;'
-    'color:#fff;font-size:42px">⚽</div>'
+    '<div style="height:150px;background:linear-gradient(135deg,#d51d2a,#ff6a3d);'
+    'border-radius:12px;display:flex;align-items:center;justify-content:center;'
+    'color:#fff;font-size:46px">⚽</div>'
 )
 
 CSS = """
 <style>
 :root{
-  --dqd-red:#d51d2a; --dqd-red2:#ff5a3c; --ink:#1b1f24; --muted:#6b7280;
-  --bg:#f5f6f8; --card:#ffffff; --line:#eceef1;
+  --dqd-red:#d51d2a; --dqd-red2:#ff5a3c; --ink:#15181d; --muted:#6b7280;
+  --bg:#f4f5f7; --card:#ffffff; --soft:#fafbfc; --line:#e9ebef;
+  --radius:16px; --shadow:0 1px 3px rgba(16,24,40,.05), 0 8px 24px rgba(16,24,40,.05);
 }
 html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
-.block-container{padding-top:1.1rem!important;padding-left:1.4rem!important;padding-right:1.4rem!important;}
-/* hero */
+.block-container{max-width:1360px!important;margin:0 auto!important;
+  padding:1.2rem 1.6rem 3rem!important;}
+
+/* ---------- hero ---------- */
 .dqd-hero{
   background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2));
-  border-radius:16px;padding:20px 24px;color:#fff;
-  box-shadow:0 10px 30px rgba(213,29,42,.25);margin-bottom:16px;
+  border-radius:var(--radius);padding:20px 26px;color:#fff;
+  box-shadow:0 10px 30px rgba(213,29,42,.22);margin-bottom:14px;
   display:flex;align-items:center;gap:16px;
 }
-.dqd-hero .logo{font-size:40px;line-height:1;}
-.dqd-hero h1{margin:0;font-size:23px;font-weight:800;letter-spacing:.5px;}
-.dqd-hero p{margin:5px 0 0;opacity:.92;font-size:13px;}
-/* section title */
+.dqd-hero .logo{font-size:38px;line-height:1;}
+.dqd-hero h1{margin:0;font-size:22px;font-weight:800;letter-spacing:.5px;}
+.dqd-hero p{margin:5px 0 0;opacity:.93;font-size:13px;}
+
+/* ---------- 通用标题 ---------- */
 .dqd-section-title{font-size:17px;font-weight:800;color:var(--ink);
-  margin:18px 0 10px;padding-left:10px;border-left:4px solid var(--dqd-red);}
-/* news container cards */
-.stContainer{border-radius:14px!important;transition:transform .15s ease, box-shadow .15s ease;}
-.stContainer:hover{transform:translateY(-4px);box-shadow:0 12px 28px rgba(0,0,0,.12)!important;}
-.dqd-title{font-weight:700;font-size:15px;line-height:1.4;color:var(--ink);min-height:42px;margin-top:6px;}
-/* selected title */
-.dqd-sel-title{font-size:20px;font-weight:800;color:var(--ink);
-  margin:22px 0 12px;padding:12px 16px;background:var(--card);border:1px solid var(--line);
-  border-left:5px solid var(--dqd-red);border-radius:12px;box-shadow:0 4px 14px rgba(0,0,0,.05);}
-/* stat tiles */
-.dqd-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:12px 0;}
-.dqd-stat{background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:14px 16px;text-align:center;box-shadow:0 2px 8px rgba(0,0,0,.03);}
+  margin:20px 0 12px;padding-left:10px;border-left:4px solid var(--dqd-red);}
+.dqd-h{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:800;
+  color:var(--ink);margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid var(--line);}
+
+/* ---------- 卡片：给 st.container 加 key 后，用官方 st-key-* 类名精准命中 ---------- */
+[class*="st-key-card_"], [class*="st-key-panel_"]{
+  background:var(--card)!important;
+  border-radius:var(--radius)!important;
+  box-shadow:var(--shadow)!important;
+  transition:box-shadow .18s ease, transform .18s ease;
+}
+[class*="st-key-card_"]:hover{
+  transform:translateY(-3px);box-shadow:0 12px 28px rgba(16,24,40,.12)!important;}
+
+/* ---------- 新闻卡片 ---------- */
+[data-testid="stImage"] img{height:150px;width:100%;object-fit:cover;
+  border-radius:12px;display:block;}
+.dqd-title{font-weight:700;font-size:15px;line-height:1.45;color:var(--ink);
+  min-height:44px;margin:8px 0 4px;}
+.dqd-meta{font-size:12px;color:var(--muted);}
+
+/* ---------- 情感概览小卡 ---------- */
+.dqd-chips{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:2px 0 14px;}
+.dqd-chip{background:var(--soft);border:1px solid var(--line);border-radius:12px;
+  padding:10px 4px;text-align:center;}
+.dqd-chip .v{font-size:19px;font-weight:800;color:var(--ink);line-height:1.2;}
+.dqd-chip .k{font-size:11px;color:var(--muted);margin-top:3px;}
+.dqd-chip.pos .v{color:#16a34a;}
+.dqd-chip.neg .v{color:#dc2626;}
+
+/* ---------- 概览磁贴 ---------- */
+.dqd-stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin:14px 0 4px;}
+.dqd-stat{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:16px;text-align:center;box-shadow:var(--shadow);}
 .dqd-stat .v{font-size:22px;font-weight:800;color:var(--ink);}
-.dqd-stat .k{font-size:12px;color:var(--muted);margin-top:2px;}
+.dqd-stat .k{font-size:12px;color:var(--muted);margin-top:3px;}
 .dqd-stat.red .v{color:var(--dqd-red);}
-/* panels */
-.dqd-panel{background:var(--card);border:1px solid var(--line);border-radius:14px;
-  padding:16px 18px;margin-top:14px;box-shadow:0 2px 8px rgba(0,0,0,.03);}
-.dqd-panel h3{margin:0 0 12px;font-size:16px;color:var(--ink);}
-/* sentiment stacked bar */
-.dqd-sent{display:flex;height:28px;border-radius:999px;overflow:hidden;margin:8px 0 6px;}
-.dqd-sent>div{display:flex;align-items:center;justify-content:center;color:#fff;font-size:12px;font-weight:700;}
-/* hot comment */
-.dqd-hot{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--dqd-red);
-  border-radius:10px;padding:11px 14px;margin-bottom:10px;}
-.dqd-hot .c{font-size:14px;color:var(--ink);line-height:1.5;}
-.dqd-hot .m{font-size:12px;color:var(--muted);margin-top:6px;}
-/* emoji bar */
-.dqd-ebar{margin:7px 0;}
-.dqd-ebar .lab{font-size:13px;color:var(--ink);}
-.dqd-ebar .track{background:#f0f1f3;border-radius:999px;height:14px;overflow:hidden;margin-top:3px;}
-.dqd-ebar .fill{background:linear-gradient(90deg,var(--dqd-red),var(--dqd-red2));height:100%;}
-/* buttons */
-.stButton>button{background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2))!important;
-  color:#fff!important;border:none!important;border-radius:10px!important;font-weight:700!important;}
-.stButton>button:hover{filter:brightness(1.05);}
+
+/* ---------- 情感堆叠条 ---------- */
+.dqd-sent{display:flex;height:26px;border-radius:999px;overflow:hidden;
+  margin:4px 0 8px;background:#eef0f3;}
+.dqd-sent>div{display:flex;align-items:center;justify-content:center;color:#fff;
+  font-size:12px;font-weight:700;transition:width .4s ease;}
+
+/* ---------- 文字说明 / 结论 ---------- */
+.dqd-note{font-size:12px;color:var(--muted);line-height:1.65;}
+.dqd-verdict{margin-top:12px;padding:10px 14px;border-radius:12px;font-size:14px;
+  font-weight:700;color:var(--ink);background:#fef6f3;border:1px solid #f7ddd5;}
+.dqd-verdict .src{font-weight:400;color:var(--muted);font-size:12px;margin-left:6px;}
+.dqd-foot{margin:26px 0 6px;text-align:center;font-size:12px;color:#9aa1ab;}
+
+/* ---------- 已选标题 / 引导 ---------- */
+.dqd-sel-title{font-size:18px;font-weight:800;color:var(--ink);
+  margin:26px 0 14px;padding:14px 18px;background:var(--card);border:1px solid var(--line);
+  border-left:5px solid var(--dqd-red);border-radius:12px;box-shadow:var(--shadow);}
+.dqd-hint{margin:18px 0;padding:16px 20px;background:var(--card);
+  border:1px dashed #d8dbe0;border-radius:12px;color:var(--muted);font-size:14px;}
+
+/* ---------- 热门评论 ---------- */
+.dqd-hot{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--dqd-red);
+  border-radius:12px;padding:12px 14px;margin-bottom:10px;}
+.dqd-hot:last-child{margin-bottom:0;}
+.dqd-hot .c{font-size:14px;color:var(--ink);line-height:1.55;}
+.dqd-hot .m{font-size:12px;color:var(--muted);margin-top:7px;}
+
+/* ---------- 表情条 ---------- */
+.dqd-ebar{margin:9px 0;}
+.dqd-ebar .lab{font-size:13px;color:var(--ink);display:flex;justify-content:space-between;}
+.dqd-ebar .track{background:#eef0f3;border-radius:999px;height:10px;overflow:hidden;margin-top:4px;}
+.dqd-ebar .fill{background:linear-gradient(90deg,var(--dqd-red),var(--dqd-red2));
+  height:100%;border-radius:999px;}
+
+/* ---------- 按钮：默认描边，primary 实心 ---------- */
+.stButton>button{border-radius:10px!important;font-weight:700!important;
+  border:1px solid var(--dqd-red)!important;color:var(--dqd-red)!important;
+  background:#fff!important;transition:background .15s ease;}
+.stButton>button:hover{background:#fef2f2!important;}
+.stButton>button[kind="primary"]{
+  background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2))!important;
+  color:#fff!important;border:none!important;}
+.stDownloadButton>button{border-radius:10px!important;font-weight:700!important;
+  border:1px solid var(--line)!important;}
 </style>
 """
 
