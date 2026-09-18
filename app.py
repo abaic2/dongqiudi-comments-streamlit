@@ -24,6 +24,7 @@ import sys
 import json
 import gzip
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pandas as pd
@@ -55,12 +56,30 @@ except Exception:  # noqa: BLE001
 
 # ------------------------- 内置示例（兜底演示用） -------------------------
 SAMPLE_NEWS = [
-    {"id": "6358712", "title": "国足0-2不敌日本，世预赛出线形势告急", "cover": None, "time": "2小时前", "tag": "国家队"},
-    {"id": "6359476", "title": "梅西任意球破门，迈阿密国际晋级季后赛", "cover": None, "time": "4小时前", "tag": "国际"},
-    {"id": "6359021", "title": "英超焦点战：阿森纳3-1逆转曼联", "cover": None, "time": "6小时前", "tag": "英超"},
-    {"id": "6358890", "title": "皇马2-0赫罗纳，稳居西甲榜首", "cover": None, "time": "8小时前", "tag": "西甲"},
-    {"id": "6358765", "title": "欧冠1/4决赛抽签：拜仁再遇皇马", "cover": None, "time": "10小时前", "tag": "欧冠"},
-    {"id": "6358633", "title": "中超第12轮：上海海港5-0大胜对手", "cover": None, "time": "12小时前", "tag": "中超"},
+    {"id": "6358712", "title": "国足0-2不敌日本，世预赛出线形势告急", "cover": None,
+     "time": "2小时前", "tag": "国家队", "league": "国家队", "comments": 2841},
+    {"id": "6359476", "title": "梅西任意球破门，迈阿密国际晋级季后赛", "cover": None,
+     "time": "4小时前", "tag": "国际", "league": "国际", "comments": 1520},
+    {"id": "6359021", "title": "英超焦点战：阿森纳3-1逆转曼联", "cover": None,
+     "time": "6小时前", "tag": "英超", "league": "英超", "comments": 3362},
+    {"id": "6358890", "title": "皇马2-0赫罗纳，稳居西甲榜首", "cover": None,
+     "time": "8小时前", "tag": "西甲", "league": "西甲", "comments": 1204},
+    {"id": "6358765", "title": "欧冠1/4决赛抽签：拜仁再遇皇马", "cover": None,
+     "time": "10小时前", "tag": "欧冠", "league": "欧冠", "comments": 986},
+    {"id": "6358633", "title": "中超第12轮：上海海港5-0大胜对手", "cover": None,
+     "time": "12小时前", "tag": "中超", "league": "中超", "comments": 745},
+]
+
+# 标签筛选：五大联赛强队 + 知名国家队 + 主要赛事/联赛
+NEWS_TAGS = [
+    # 赛事 / 联赛
+    "英超", "意甲", "西甲", "德甲", "法甲", "欧冠", "欧联", "中超", "世界杯",
+    # 五大联赛强队
+    "曼城", "利物浦", "阿森纳", "切尔西", "曼联", "热刺", "皇马", "巴萨", "马竞",
+    "拜仁", "多特", "尤文", "国米", "AC米兰", "那不勒斯", "巴黎",
+    # 知名国家队
+    "国足", "阿根廷", "巴西", "法国", "英格兰", "西班牙", "德国", "葡萄牙",
+    "荷兰", "意大利", "日本", "韩国",
 ]
 
 SAMPLE = {
@@ -231,9 +250,20 @@ def _http_get_text(url, headers):
         return _read_body(r)
 
 
-# App tab feed（实测有内容且去重后量最大的 tab）：
-# 1=头条 3=英超 4=意甲 5=西甲 6=德甲 11=集锦 12=法甲 13=综合 37=闲情
-APP_FEED_TABS = [1, 3, 4, 5, 6, 11, 12, 13, 37]
+# App tab feed：扫描 1-200 实测「有内容」的栏目（label 作为该文所属联赛/栏目标签）。
+# 已排除非新闻栏目：66 主贴跳转 / 68 装备 / 101 关注 / 119 海报。
+# 全部合并去重后约 285 条新闻，搜索与标签筛选都基于这个语料。
+APP_FEED_TABS = [1, 3, 4, 5, 6, 11, 12, 13, 37, 43, 55, 56, 57, 58, 59,
+                 71, 99, 100, 103, 107, 109, 110, 113, 114, 120, 172, 176]
+
+FEED_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+}
 
 
 def parse_feed(data):
@@ -261,13 +291,61 @@ def parse_feed(data):
     return out
 
 
-def fetch_news_list():
-    """获取懂球帝实时新闻列表（实测可拿到 80+ 条）。
+def _fetch_tab(tab):
+    """抓取单个 tab（供线程池调用）。返回 (label, articles)，失败返回 (None, [])。"""
+    try:
+        data = _http_get_json(
+            f"https://api.dongqiudi.com/app/tabs/iphone/{tab}.json?version=177",
+            FEED_HEADERS,
+        )
+    except Exception:  # noqa: BLE001
+        return None, []
+    return (data or {}).get("label") or "", parse_feed(data)
+
+
+def fetch_comment_count(article_id):
+    """从 www 文章页解析评论总数（commentTotal）。
+
+    走 www.dongqiudi.com，不依赖可能被部署环境拦截的 api 域名，因此更可靠。
+    """
+    try:
+        h = dict(FEED_HEADERS)
+        h["Accept"] = "text/html,application/xhtml+xml,*/*;q=0.8"
+        html = _http_get_text(f"https://www.dongqiudi.com/articles/{article_id}.html", h)
+        m = re.search(r"commentTotal[:=\"\s]+(\d+)", html)
+        return int(m.group(1)) if m else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def enrich_comment_counts(items):
+    """给「评论数未知」的新闻补评论数（并发 + 会话内缓存，通常只补当前页）。"""
+    if "cnt_cache" not in st.session_state:
+        st.session_state.cnt_cache = {}
+    cache = st.session_state.cnt_cache
+    todo = [a for a in items if a.get("comments") is None and a["id"] not in cache]
+    if todo:
+        try:
+            with ThreadPoolExecutor(max_workers=8) as ex:
+                got = list(ex.map(lambda x: fetch_comment_count(x["id"]), todo))
+            for a, c in zip(todo, got):
+                cache[a["id"]] = c
+        except Exception:  # noqa: BLE001
+            pass
+    for a in items:
+        if a.get("comments") is None and cache.get(a["id"]) is not None:
+            a["comments"] = cache[a["id"]]
+
+
+def fetch_news_list(deep=False):
+    """获取懂球帝实时新闻列表。
 
     主源：App tab feed `api.dongqiudi.com/app/tabs/iphone/{tab}.json`
-          遍历多个内容 tab（头条/英超/意甲/西甲/德甲/集锦/法甲/综合/闲情）后去重。
-          注：该接口的 prev/page/before 参数实测**不会真正翻页**（永远返回同一页），
-              所以靠"多 tab"而不是"翻页"来扩量。
+      - deep=False（默认）：只抓 APP_FEED_TABS 这批评分较高的栏目 → 约 2 秒、260+ 条
+      - deep=True：扫描 1-400 全部栏目 → 约 30 秒、1300+ 条（用户点「深度抓取」时才用）
+
+      注：该接口的 prev/page/before 参数实测**不会真正翻页**（永远返回同一页），
+          所以只能靠"多栏目合并"来扩量，不能靠翻页。
     兜底：官网首页 HTML（约 25 条）
     再失败 → 内置示例
 
@@ -275,35 +353,25 @@ def fetch_news_list():
       - 抓到文章 -> (真实列表, False)
       - 全部失败 -> (内置示例, True)，由调用方显示 ⚠️，绝不假装实时。
     """
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-            "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-    }
-
-    # ---- 主源：多个 tab 合并去重（单 tab 失败不影响其它）----
+    # ---- 主源：多个 tab 并发抓取后合并去重（单 tab 失败不影响其它）----
+    tabs = range(1, 401) if deep else APP_FEED_TABS
     arts, seen = [], set()
-    for tab in APP_FEED_TABS:
-        try:
-            data = _http_get_json(
-                f"https://api.dongqiudi.com/app/tabs/iphone/{tab}.json?version=177",
-                headers,
-            )
-        except Exception:  # noqa: BLE001
-            continue
-        for a in parse_feed(data):
-            if a["id"] in seen:
-                continue
-            seen.add(a["id"])
-            arts.append(a)
+    try:
+        with ThreadPoolExecutor(max_workers=16 if deep else 10) as ex:
+            for label, items in ex.map(_fetch_tab, tabs):
+                for a in items:
+                    if a["id"] in seen:
+                        continue
+                    seen.add(a["id"])
+                    a["league"] = label or ""
+                    arts.append(a)
+    except Exception:  # noqa: BLE001
+        pass
     if arts:
         return arts, False
 
-    # ---- 兜底：官网首页 HTML ----
-    h2 = dict(headers)
+    # ---- 兜底：官网首页 HTML（该页面无 league 字段）----
+    h2 = dict(FEED_HEADERS)
     h2["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     for site in ("https://www.dongqiudi.com/", "https://m.dongqiudi.com/"):
         try:
@@ -773,6 +841,8 @@ def main():
         st.session_state.page = 1
     if "last_query" not in st.session_state:
         st.session_state.last_query = ""
+    if "last_tag" not in st.session_state:
+        st.session_state.last_tag = None
 
     # 支持 ?sel=<文章ID> 直接打开某篇的分析（可分享链接）
     _qp_sel = st.query_params.get("sel")
@@ -787,11 +857,20 @@ def main():
             st.session_state.news = fetch_news_list()
 
     # ---- 工具栏：刷新按钮（左） + 状态提示（右） ----
-    c_btn, c_status = st.columns([1, 4], gap="medium")
+    c_btn, c_deep, c_status = st.columns([1, 1.15, 3], gap="medium")
     with c_btn:
         if st.button("🔄 刷新实时新闻", width="stretch", type="primary"):
             with st.spinner("正在重新获取懂球帝实时新闻…"):
                 st.session_state.news = fetch_news_list()
+                st.session_state.selected = None
+                st.session_state.results = {}
+                st.session_state.page = 1
+                st.rerun()
+    with c_deep:
+        if st.button("📚 深度抓取全部栏目", width="stretch",
+                     help="扫描懂球帝 1-400 号全部栏目，约 30 秒，可拿到 1300+ 条新闻"):
+            with st.spinner("正在深度抓取全部栏目（约 30 秒，请稍候）…"):
+                st.session_state.news = fetch_news_list(deep=True)
                 st.session_state.selected = None
                 st.session_state.results = {}
                 st.session_state.page = 1
@@ -801,37 +880,61 @@ def main():
         if is_demo_news:
             st.warning("⚠️ 未能联网获取实时新闻，当前为内置示例新闻。", icon="⚠️")
         else:
-            st.success(f"✅ 已加载 {len(news)} 条懂球帝实时新闻，点选卡片即可爬取评论。", icon="✅")
+            st.success(f"✅ 已加载 {len(news)} 条懂球帝实时新闻 —— "
+                       f"可用搜索 / 标签筛选，点选卡片即可爬取评论。", icon="✅")
 
-    # ---- 新闻区：搜索 + 每页条数 ----
-    st.markdown('<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论</div>',
+    # ---- 新闻区：标题 + 搜索 + 标签 + 每页条数 ----
+    src_name = ("App 接口 · 多栏目合并" if any(a.get("league") for a in news)
+                else ("内置示例" if is_demo_news else "官网首页"))
+    st.markdown(f'<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论'
+                f'<span class="dqd-src">数据源：{esc(src_name)}</span></div>',
                 unsafe_allow_html=True)
+
     c_q, c_page = st.columns([3, 1], gap="medium")
     with c_q:
         q = st.text_input("搜索新闻", key="news_query", label_visibility="collapsed",
-                          placeholder="🔍 搜索新闻标题（如：亚冠 / 曼城 / 申花）")
+                          placeholder="🔍 搜索全部新闻标题（如：曼城 / 皇马 / 国足）")
     with c_page:
         per_page = st.selectbox("每页条数", [9, 12, 18, 24], index=1,
                                 key="per_page", label_visibility="collapsed")
 
-    # 关键词变化 → 回到第 1 页
-    if st.session_state.last_query != q:
+    # ---- 快捷标签：点一下只看相关新闻（再点一次取消）----
+    st.markdown('<div class="dqd-taglabel">⚡ 快捷标签 · 点一下只看相关新闻</div>',
+                unsafe_allow_html=True)
+    tag = st.pills("标签", NEWS_TAGS, selection_mode="single", key="tag_pick",
+                   label_visibility="collapsed")
+
+    # 关键词 / 标签变化 → 回到第 1 页
+    if (st.session_state.last_query != q) or (st.session_state.get("last_tag") != tag):
         st.session_state.last_query = q
+        st.session_state.last_tag = tag
         st.session_state.page = 1
 
     qn = (q or "").strip().lower()
-    filtered = [a for a in news
-                if (not qn)
-                or qn in a["title"].lower()
-                or qn in str(a.get("tag") or "").lower()]
+    tn = (tag or "").strip().lower()
+
+    def _hit(a):
+        if tn:  # 标签优先级最高：先按栏目/联赛匹配，再按标题匹配
+            return (tn in str(a.get("league") or "").lower()) or (tn in a["title"].lower())
+        if qn:  # 搜索覆盖「全部已加载新闻」
+            return (qn in a["title"].lower()
+                    or qn in str(a.get("tag") or "").lower()
+                    or qn in str(a.get("league") or "").lower())
+        return True
+
+    filtered = [a for a in news if _hit(a)]
     total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
     page = min(max(1, int(st.session_state.page)), total_pages)
     st.session_state.page = page
     page_items = filtered[(page - 1) * per_page: page * per_page]
+    enrich_comment_counts(page_items)  # 缺评论数的卡片并发补齐（会话内缓存）
 
     # ---- 新闻网格（3 列卡片，按当前页渲染）----
     if not filtered:
-        st.markdown(f'<div class="dqd-hint">没有匹配「{esc(q)}」的新闻，换个关键词试试。</div>',
+        cond = f'标签「{esc(tag)}」' if tn else f'关键词「{esc(q)}」'
+        st.markdown(f'<div class="dqd-hint">已加载的 {len(news)} 条新闻里没有匹配 {cond} 的内容。'
+                    f'可以：① 换个条件；② 点「🔄 刷新实时新闻」拉最新；'
+                    f'③ 点「📚 深度抓取全部栏目」把语料扩到 1300+ 条再搜。</div>',
                     unsafe_allow_html=True)
     else:
         cols = st.columns(3, gap="medium")
@@ -847,11 +950,13 @@ def main():
                         st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
                     st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>',
                                 unsafe_allow_html=True)
-                    meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
+                    # 分类优先显示栏目/联赛（App 源的 category 一律是「足球」，信息量低）
+                    meta = " · ".join([x for x in
+                                       [art.get("league") or art.get("tag"), art.get("time")] if x])
                     cnt = art.get("comments")
                     badge = (f'<span class="dqd-cnt">💬 {cnt:,} 条评论</span>'
                              if cnt is not None else
-                             '<span class="dqd-cnt none">💬 评论数未知</span>')
+                             '<span class="dqd-cnt none">💬 —</span>')
                     st.markdown(
                         f'<div class="dqd-metarow">'
                         f'<span class="dqd-meta">{esc(meta or "懂球帝")}</span>{badge}</div>',
@@ -868,6 +973,8 @@ def main():
                 st.rerun()
         with pg2:
             info = f"第 {page} / {total_pages} 页　·　共 {len(filtered)} 条"
+            if tn:
+                info += f"　·　标签「{esc(tag)}」"
             if qn:
                 info += f"　·　关键词「{esc(q)}」"
             st.markdown(f'<div class="dqd-pageinfo">{info}</div>', unsafe_allow_html=True)
@@ -1051,7 +1158,11 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
 
 /* ---------- 通用标题 ---------- */
 .dqd-section-title{font-size:17px;font-weight:800;color:var(--ink);
-  margin:20px 0 12px;padding-left:10px;border-left:4px solid var(--dqd-red);}
+  margin:20px 0 12px;padding-left:10px;border-left:4px solid var(--dqd-red);
+  display:flex;align-items:baseline;gap:10px;flex-wrap:wrap;}
+.dqd-src{font-size:12px;font-weight:600;color:var(--muted);}
+/* 标签筛选标题 */
+.dqd-taglabel{font-size:13px;font-weight:700;color:var(--muted);margin:10px 0 4px;}
 .dqd-h{display:flex;align-items:center;gap:8px;font-size:15px;font-weight:800;
   color:var(--ink);margin:0 0 12px;padding-bottom:10px;border-bottom:1px solid var(--line);}
 
