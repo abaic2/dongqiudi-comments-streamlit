@@ -908,6 +908,13 @@ LEAGUE_GROUPS = {
     "其他联赛": ["沙特联", "美职联", "苏超(江苏)"],
 }
 
+# 球员评分·能力榜：汇总场次选项（None = 整个赛季，取该赛季全部已结束比赛）
+_RT_OPTS = {
+    "近 3 场": 3, "近 5 场": 5, "近 8 场": 8, "近 10 场": 10,
+    "近 15 场": 15, "近 20 场": 20, "近 30 场": 30,
+    "整个赛季（全部已结束场次）": None,
+}
+
 
 def echarts(option, height=380):
     """渲染一个 ECharts 图表。
@@ -1116,19 +1123,40 @@ def chart_lineup_compare(A, B):
     }
 
 
-def chart_rating_trend(matches):
-    """球队首发均分走势。"""
+def chart_rating_trend(matches, team_name=""):
+    """球队首发均分走势（场次多时改用「日期 + 对手」短标签并自动抽稀）。"""
     d = list(reversed(matches))
+    n = len(d)
+    dense = n > 22
+
+    def _short(m):
+        date = (m.get("start_play") or "")[5:10]
+        lab = re.sub(r"（[^）]*）\s*$", "", m.get("label") or "").strip()
+        opp = ""
+        if team_name and team_name in lab:
+            rest = lab.replace(team_name, " ").strip()
+            rest = re.sub(r"\d+\s*[-:]\s*\d+", " ", rest)
+            opp = rest.strip()[:5]
+        return f"{date}\n{opp}" if opp else date
+
     return {
         "tooltip": {"trigger": "axis"},
-        "grid": {"left": 46, "right": 18, "top": 26, "bottom": 78},
-        "xAxis": {"type": "category", "data": [m["label"] for m in d],
-                  "axisLabel": {"rotate": 32, "fontSize": 10, "color": "#6b7280"}},
+        "grid": {"left": 46, "right": 18, "top": 26,
+                 "bottom": 60 if dense else 78},
+        "xAxis": {"type": "category",
+                  "data": [_short(m) if dense else m["label"] for m in d],
+                  "axisLabel": {"rotate": 0 if dense else 32,
+                                "lineHeight": 11,
+                                "fontSize": 9 if dense else 10,
+                                "interval": max(1, n // 14) if dense else 0,
+                                "color": "#6b7280"}},
         "yAxis": {"type": "value", "min": 5, "max": 10, "splitLine": _GRID},
         "series": [{"type": "line", "name": "首发均分", "smooth": True,
                     "data": [m["avg_rate"] for m in d],
-                    "itemStyle": {"color": _RED}, "lineStyle": {"width": 3},
-                    "label": {"show": True, "fontSize": 10, "color": "#6b7280"}}],
+                    "itemStyle": {"color": _RED},
+                    "lineStyle": {"width": 2 if dense else 3},
+                    "symbolSize": 3 if dense else 6,
+                    "label": {"show": not dense, "fontSize": 10, "color": "#6b7280"}}],
     }
 
 
@@ -2058,13 +2086,18 @@ def page_data():
                 tn = st.selectbox("选择球队", [t for t, _ in teams_sd], key="dt_rt_team")
             tid = dict(teams_sd)[tn]
             with cc2:
-                n = st.selectbox("汇总场次", [3, 5, 8, 10], index=1, key="dt_rt_n")
+                nlab = st.selectbox("汇总场次", list(_RT_OPTS.keys()), index=1,
+                                    key="dt_rt_n",
+                                    help="选「整个赛季」会统计该赛季全部已结束比赛"
+                                         "（首次约需几秒）")
+            n = _RT_OPTS[nlab]
             with cc3:
                 season, season_label = _season_picker(tid, "dt_pr_season")
+            span = nlab if n else "整个赛季"
             try:
-                with st.spinner(f"正在抓取「{tn}」{season_label or '当前赛季'} 最近 {n} 场"
-                                f"阵容评分…"):
-                    rk = _cached(f"ratings_{tid}_{n}_{season}",
+                with st.spinner(f"正在抓取「{tn}」{season_label or '当前赛季'} {span}"
+                                f"的阵容评分…"):
+                    rk = _cached(f"ratings_{tid}_{n or 'all'}_{season}",
                                  DD.fetch_team_ratings, tid, n, season)
             except Exception as e:  # noqa: BLE001
                 st.error(f"评分加载失败：{type(e).__name__}: {e}")
@@ -2089,9 +2122,13 @@ def page_data():
                 st.markdown(render_stat_tiles([
                     (rk.get("team_avg") or "—", f"{tn} 场均首发评分", "red"),
                     (team_ability or "—", f"{tn} 球员能力均值", "red"),
-                    (len(matches), "统计场次", ""),
-                    (len(players), "涉及球员", ""),
+                    (len(matches), "本次统计场次", ""),
+                    (rk.get("played_total", len(matches)), "该赛季已结束场次", ""),
                 ]), unsafe_allow_html=True)
+                st.caption(f"赛季 **{season_label or '当前'}** · 区间 **{span}** · "
+                           f"共统计 {rk.get('used', len(matches))} / "
+                           f"{rk.get('played_total', len(matches))} 场已结束比赛"
+                           f"（含杯赛 / 洲际赛）。")
                 cc3, cc4 = st.columns([1.2, 1], gap="large")
                 with cc3:
                     with st.container(border=True, key="dt_p_pr_bar"):
@@ -2100,7 +2137,8 @@ def page_data():
                 with cc4:
                     with st.container(border=True, key="dt_p_pr_trend"):
                         st.markdown(render_h("球队首发均分走势"), unsafe_allow_html=True)
-                        echarts(chart_rating_trend(matches), 430)
+                        echarts(chart_rating_trend(matches, tn),
+                                430 if len(matches) <= 22 else 500)
                 if with_ab:
                     cc5, cc6 = st.columns([1, 1], gap="large")
                     with cc5:
@@ -2149,7 +2187,9 @@ def page_data():
                     st.dataframe(pd.DataFrame([{
                         "球员": p["name"], "位置": p["position"], "出场": p["matches"],
                         "能力值": p.get("ability"), "场均评分": p["avg_rate"], "最高": p["best"],
-                        "各场评分": " / ".join(str(x) for x in p["ratings"]),
+                        "各场评分": (" / ".join(str(x) for x in p["ratings"][:24])
+                                     + ("　…（共 %d 场）" % len(p["ratings"])
+                                        if len(p["ratings"]) > 24 else "")),
                     } for p in sorted(players, key=lambda x: -(x.get("ability") or 0))]),
                         width="stretch", hide_index=True, height=420)
                 with st.container(border=True, key="dt_p_pr_matches"):
@@ -2157,7 +2197,8 @@ def page_data():
                     st.dataframe(pd.DataFrame([{
                         "比赛": m["label"], "赛事": m["competition"], "时间": m["start_play"][:16],
                         "阵型": m["formation"], "首发均分": m["avg_rate"], "MVP": m["mvp"],
-                    } for m in matches]), width="stretch", hide_index=True, height=260)
+                    } for m in matches]), width="stretch", hide_index=True,
+                        height=260 if len(matches) <= 24 else 460)
 
     # ---------- 赛果预测：胜率 + 比分 ----------
     with t_pred:

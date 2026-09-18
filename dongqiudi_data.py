@@ -789,16 +789,18 @@ def poisson_predict(home_ability, home_form, away_ability, away_form,
     }
 
 
-def fetch_team_ratings(team_id, limit=6, season=None):
+def fetch_team_ratings(team_id, limit=6, season=None, workers=10):
     """抓球队最近 limit 场已结束比赛的阵容，汇总每名球员的场均评分。
 
     team_id 用**网页版原值**（如 1755=皇马 / 513=阿森纳）；赛季传 "2025-2026"
-    可查历史赛季。阵容里的 team_id 是 sport-data 内部 ID，这里用赛程返回的
-    my_ids 做兼容比对，避免西甲/意甲/中超因为 ID 空间不同而一场都匹配不上
-    （历史 bug，2026-09-18 修）。
+    可查历史赛季。**limit 传 None / 0 表示整个赛季**。
+    阵容请求用线程池并发（默认 10 路），整季 60 场左右约 2~4 秒。
+    阵容里的 team_id 是 sport-data 内部 ID，这里用赛程返回的 my_ids 做兼容比对，
+    避免西甲/意甲/中超因为 ID 空间不同而一场都匹配不上（历史 bug，2026-09-18 修）。
 
     返回 {"matches":[...], "players":[{name,position,matches,avg_rate,best,ratings}],
-          "team_avg": float|None}
+          "team_avg": float|None, "played_total": 该赛季已结束场次,
+          "used": 实际统计场次}
     """
     all_sched = fetch_team_schedule(team_id, season=season)
     my_ids = set(sport_team_id_variants(team_id))
@@ -807,14 +809,31 @@ def fetch_team_ratings(team_id, limit=6, season=None):
         if m.get("my_id"):
             my_ids.add(str(m["my_id"]))
     my_ids.discard("")
-    sched = [m for m in all_sched
-             if m.get("status") == "Played" and m["match_id"]]
-    sched = list(reversed(sched))[:limit]          # 最近的在前
-    matches, agg = [], {}
-    for m in sched:
+    played = [m for m in all_sched if m.get("status") == "Played" and m["match_id"]]
+    played_total = len(played)
+    sched = list(reversed(played))                 # 最近的在前
+    try:
+        n = int(limit or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        sched = sched[:n]
+
+    def _lineup(m):
         try:
-            lu = fetch_match_lineup(m["match_id"])
+            return m, fetch_match_lineup(m["match_id"])
         except Exception:  # noqa: BLE001
+            return m, None
+
+    matches, agg = [], {}
+    from concurrent.futures import ThreadPoolExecutor
+    if sched:
+        with ThreadPoolExecutor(max_workers=max(1, min(workers, len(sched)))) as ex:
+            results = list(ex.map(_lineup, sched))
+    else:
+        results = []
+    for m, lu in results:                          # 保持「最近的在前」顺序
+        if not lu:
             continue
         side = None
         for k in ("A", "B"):
@@ -852,5 +871,7 @@ def fetch_team_ratings(team_id, limit=6, season=None):
     return {
         "matches": matches,
         "players": players,
+        "played_total": played_total,
+        "used": len(matches),
         "team_avg": round(sum(team_vals) / len(team_vals), 2) if team_vals else None,
     }
