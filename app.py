@@ -367,8 +367,17 @@ def parse_articles(data):
     return out
 
 
+# 首页锚点文本里会混入的栏目名，用于清理标题尾部
+HOME_CATS = set("""
+足球 中国足球 国内 国际 五洲 英超 英冠 意甲 意乙 西甲 西乙 德甲 德乙 法甲 法乙 荷甲 葡超 苏超
+土超 俄超 中超 中甲 亚冠 欧冠 欧联 欧协联 世界杯 欧洲杯 世预赛 亚洲杯 美洲杯 国家队 国足
+美职联 日职 韩K联 沙特联 综合 集锦 闲情 专题 深度 评论 观点 数据 视频 图片 转会 伤病 电竞
+篮球 NBA CBA 网球 F1 高尔夫 排球 乒乓球 羽毛球 赛车 综合体育
+""".split())
+
+
 def parse_homepage(html):
-    """从官网首页 HTML 中稳健抽取 /articles/{id}.html 文章卡片（含标题/封面）。
+    """从官网首页 HTML 中稳健抽取 /articles/{id}.html 文章卡片（含标题/封面/评论数）。
 
     策略：优先用 <a href=".../articles/{id}.html">链接文本</a> 抽取（最可靠），
     链接文本里通常含「分类 标题 时间·评论数」，做必要清洗后保留标题；
@@ -390,13 +399,23 @@ def parse_homepage(html):
         # 优先取 class 含 title 的元素文本，否则取整段链接文本
         tm = re.search(r'class=["\'][^"\']*title[^"\']*["\']>(.*?)</', inner, re.IGNORECASE | re.DOTALL)
         raw = tm.group(1) if tm else inner
-        text = re.sub(r"<[^>]+>", " ", raw)
-        text = re.sub(r"\s+", " ", text).strip()
-        # 去除尾部/混杂的元数据：日期、评论数、相对时间
-        text = re.sub(r"\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}.*$", "", text).strip()
-        text = re.sub(r".*?·\s*\d+\s*评论.*$", "", text).strip()
-        text = re.sub(r"\d+\s*评\s*.*$", "", text).strip()
+        txt = re.sub(r"<[^>]+>", " ", raw)
+        txt = re.sub(r"\s+", " ", txt).strip()
+        # 评论数：首页有两种写法 ——「· 1971 评论」和「534 评」
+        cnt_m = re.search(r"(?:·\s*)?(\d+)\s*评(?:论)?", txt)
+        comments = int(cnt_m.group(1)) if cnt_m else None
+        # 清理标题：尾部日期 / 评论数 / 相对时间，开头的「足球」大类
+        text = re.sub(r"\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}.*$", "", txt).strip()
+        text = re.sub(r"(?:·\s*)?\d+\s*评(?:论)?.*$", "", text).strip()
         text = re.sub(r"(刚刚|分钟前|小时前|天前).*$", "", text).strip()
+        text = re.sub(r"^足球\s*", "", text).strip()
+        text = re.sub(r"^[·\-–—\s]+", "", text)
+        text = re.sub(r"[·\-–—\s]+$", "", text).strip()
+        # 去掉尾部残留的栏目名（如「早报：… 英超 意甲」）
+        parts = text.split()
+        while len(parts) > 1 and parts[-1] in HOME_CATS:
+            parts.pop()
+        text = " ".join(parts).strip()
         if len(text) < 4:
             text = f"懂球帝文章 #{aid}"
         # 往前 2000 字符找封面图
@@ -405,7 +424,8 @@ def parse_homepage(html):
         cover = cm.group(1) if cm else None
         if cover and cover.startswith("//"):
             cover = "https:" + cover
-        out.append({"id": aid, "title": text, "cover": cover, "time": "", "tag": "", "raw_time": None})
+        out.append({"id": aid, "title": text, "cover": cover, "time": "",
+                    "tag": "", "raw_time": None, "comments": comments})
         if len(out) >= 40:
             break
     # 2) 兜底：宽松匹配任何 /articles/{id}.html
@@ -415,7 +435,8 @@ def parse_homepage(html):
             if aid in seen:
                 continue
             seen.add(aid)
-            out.append({"id": aid, "title": f"懂球帝文章 #{aid}", "cover": None, "time": "", "tag": "", "raw_time": None})
+            out.append({"id": aid, "title": f"懂球帝文章 #{aid}", "cover": None, "time": "",
+                        "tag": "", "raw_time": None, "comments": None})
     # 去重保序
     uniq = {}
     for o in out:
@@ -827,10 +848,14 @@ def main():
                     st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>',
                                 unsafe_allow_html=True)
                     meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
-                    if art.get("comments") is not None:
-                        meta += f"　💬 {art['comments']}"
-                    st.markdown(f'<div class="dqd-meta">{esc(meta or "懂球帝")}</div>',
-                                unsafe_allow_html=True)
+                    cnt = art.get("comments")
+                    badge = (f'<span class="dqd-cnt">💬 {cnt:,} 条评论</span>'
+                             if cnt is not None else
+                             '<span class="dqd-cnt none">💬 评论数未知</span>')
+                    st.markdown(
+                        f'<div class="dqd-metarow">'
+                        f'<span class="dqd-meta">{esc(meta or "懂球帝")}</span>{badge}</div>',
+                        unsafe_allow_html=True)
                     if st.button("📥 爬取评论", key=f"btn_{art['id']}", width="stretch"):
                         st.session_state.selected = art["id"]
                         st.session_state.sel_title = art["title"]
@@ -1046,6 +1071,12 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
 .dqd-title{font-weight:700;font-size:15px;line-height:1.45;color:var(--ink);
   min-height:44px;margin:8px 0 4px;}
 .dqd-meta{font-size:12px;color:var(--muted);}
+/* 卡片底部：分类/时间 + 评论数角标 */
+.dqd-metarow{display:flex;align-items:center;justify-content:space-between;
+  gap:8px;margin-top:2px;}
+.dqd-cnt{font-size:12px;font-weight:700;color:var(--dqd-red);background:#fdeaea;
+  border:1px solid #f5c2c2;border-radius:999px;padding:2px 10px;white-space:nowrap;}
+.dqd-cnt.none{color:#9aa1ab;background:#f6f7f9;border-color:var(--line);font-weight:400;}
 
 /* ---------- 情感概览小卡 ---------- */
 .dqd-chips{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin:2px 0 14px;}
