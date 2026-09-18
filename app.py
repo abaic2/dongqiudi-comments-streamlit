@@ -39,6 +39,12 @@ except ImportError:  # 适配 demo 目录（爬虫在父目录）
     sys.path.insert(0, os.path.dirname(HERE))
     import dongqiudi_comments as dqd  # noqa: E402
 
+try:
+    import dongqiudi_data as DD  # noqa: E402  功能二：数据分析数据层
+except ImportError:  # 适配 demo 目录
+    sys.path.insert(0, os.path.dirname(HERE))
+    import dongqiudi_data as DD  # noqa: E402
+
 # ------------------------- 可选依赖（带兜底） -------------------------
 try:
     import jieba
@@ -871,11 +877,185 @@ def render_hot(comments, topn=8):
     return html
 
 
+# ========================= 功能二：数据分析（ECharts） =======================
+# 用 st.components.v1.html + CDN（三源回退）渲染 ECharts，无需额外 Python 依赖。
+_ECHARTS_TPL = """
+<div id="ec" style="width:100%;height:__HEIGHT__px"></div>
+<script src="https://cdn.staticfile.org/echarts/5.5.0/echarts.min.js"></script>
+<script>window.echarts||document.write('<script src="https://cdn.bootcdn.net/ajax/libs/echarts/5.5.0/echarts.min.js"><\\/script>');</script>
+<script>window.echarts||document.write('<script src="https://unpkg.com/echarts@5.5.0/dist/echarts.min.js"><\\/script>');</script>
+<script>
+(function(){
+  var el=document.getElementById('ec');
+  if(!window.echarts){el.innerHTML='<div style="padding:24px;color:#8a9099;font-size:13px">'
+    +'图表库加载失败：需要联网加载 ECharts（已依次尝试 staticfile / bootcdn / unpkg）。</div>';return;}
+  var c=echarts.init(el);
+  c.setOption(__OPTION__);
+  window.addEventListener('resize',function(){c.resize();});
+})();
+</script>
+"""
+
+_RED = "#d51d2a"
+_RED2 = "#ff5a3c"
+_GREY = "#9ca3af"
+_GRID = {"lineStyle": {"color": "#eef0f3"}}
+
+LEAGUE_GROUPS = {
+    "欧洲五大联赛 / 欧战": ["英超", "西甲", "意甲", "德甲", "法甲", "欧冠", "欧联", "欧协联"],
+    "国际大赛 / 国家队": ["世界杯", "亚洲杯", "U17世界杯", "U20女足世界杯"],
+    "中国联赛 / 杯赛": ["中超", "中甲", "中乙", "足协杯", "亚冠精英", "亚冠二级"],
+    "其他联赛": ["沙特联", "美职联", "苏超(江苏)"],
+}
+
+
+def echarts(option, height=380):
+    """渲染一个 ECharts 图表。
+
+    用 st.iframe 承载（它会自动识别 HTML 字符串并允许执行 JS）。
+    注：旧的 st.components.v1.html 已标记「2026-06-01 后移除」，故不再使用。
+    """
+    opt = json.dumps(option, ensure_ascii=False)
+    html = _ECHARTS_TPL.replace("__HEIGHT__", str(height)).replace("__OPTION__", opt)
+    st.iframe(html, height=height + 14)
+
+
+def _cached(key, fn, *args):
+    """会话内缓存，避免同一份数据反复请求。点「重新拉取数据」可清空。"""
+    if "data_cache" not in st.session_state:
+        st.session_state.data_cache = {}
+    cache = st.session_state.data_cache
+    if key not in cache:
+        cache[key] = fn(*args)
+    return cache[key]
+
+
+def chart_points(rows, top=12):
+    d = rows[:top]
+    return {
+        "grid": {"left": 46, "right": 18, "top": 28, "bottom": 76},
+        "tooltip": {"trigger": "axis"},
+        "xAxis": {"type": "category", "data": [r["球队"] for r in d],
+                  "axisLabel": {"rotate": 40, "fontSize": 11, "color": "#6b7280"}},
+        "yAxis": {"type": "value", "splitLine": _GRID,
+                  "axisLabel": {"color": "#6b7280"}},
+        "series": [{"type": "bar", "name": "积分", "data": [r["积分"] for r in d],
+                    "itemStyle": {"color": _RED, "borderRadius": [4, 4, 0, 0]},
+                    "label": {"show": True, "position": "top", "fontSize": 10,
+                              "color": "#6b7280"}}],
+    }
+
+
+def chart_goals(rows, top=10):
+    d = rows[:top]
+    return {
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 40, "bottom": 76},
+        "xAxis": {"type": "category", "data": [r["球队"] for r in d],
+                  "axisLabel": {"rotate": 40, "fontSize": 11, "color": "#6b7280"}},
+        "yAxis": {"type": "value", "splitLine": _GRID},
+        "series": [
+            {"name": "进球", "type": "bar", "data": [r["进球"] for r in d],
+             "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]}},
+            {"name": "失球", "type": "bar", "data": [r["失球"] for r in d],
+             "itemStyle": {"color": _GREY, "borderRadius": [3, 3, 0, 0]}},
+        ],
+    }
+
+
+def chart_scorers(rows, top=15):
+    d = list(reversed(rows[:top]))
+    return {
+        "grid": {"left": 100, "right": 36, "top": 16, "bottom": 24},
+        "tooltip": {"trigger": "axis"},
+        "xAxis": {"type": "value", "splitLine": _GRID},
+        "yAxis": {"type": "category", "data": [r["球员"] for r in d],
+                  "axisLabel": {"fontSize": 11, "color": "#15181d"}},
+        "series": [{"type": "bar", "name": "进球", "data": [r["进球"] for r in d],
+                    "itemStyle": {"color": _RED2, "borderRadius": [0, 4, 4, 0]},
+                    "label": {"show": True, "position": "right", "fontSize": 10,
+                              "color": "#6b7280"}}],
+    }
+
+
+def chart_pie(pairs, top=8):
+    items = sorted(pairs, key=lambda x: -x[1])
+    d = items[:top]
+    rest = sum(c for _, c in items[top:])
+    if rest > 0:
+        d = d + [("其他", rest)]
+    return {
+        "tooltip": {"trigger": "item", "formatter": "{b}: {c} ({d}%)"},
+        "legend": {"bottom": 0, "type": "scroll", "textStyle": {"fontSize": 11}},
+        "series": [{"type": "pie", "radius": ["40%", "66%"], "center": ["50%", "43%"],
+                    "data": [{"name": k, "value": v} for k, v in d],
+                    "label": {"fontSize": 11},
+                    "itemStyle": {"borderColor": "#fff", "borderWidth": 2}}],
+    }
+
+
+def chart_compare(rows, teams):
+    d = sorted([r for r in rows if r["球队"] in teams], key=lambda r: -r["积分"])
+    return {
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 40, "bottom": 56},
+        "xAxis": {"type": "category", "data": [r["球队"] for r in d],
+                  "axisLabel": {"rotate": 30, "fontSize": 11}},
+        "yAxis": {"type": "value", "splitLine": _GRID},
+        "series": [
+            {"name": "积分", "type": "bar", "data": [r["积分"] for r in d],
+             "itemStyle": {"color": _RED, "borderRadius": [3, 3, 0, 0]}},
+            {"name": "进球", "type": "bar", "data": [r["进球"] for r in d],
+             "itemStyle": {"color": _RED2, "borderRadius": [3, 3, 0, 0]}},
+            {"name": "失球", "type": "bar", "data": [r["失球"] for r in d],
+             "itemStyle": {"color": _GREY, "borderRadius": [3, 3, 0, 0]}},
+        ],
+    }
+
+
+def chart_player_seasons(seasons, top=10):
+    d = list(reversed(seasons[:top]))
+
+    def n(k):
+        return [DD._int(s.get(k)) for s in d]
+
+    return {
+        "legend": {"top": 0, "textStyle": {"fontSize": 12}},
+        "tooltip": {"trigger": "axis"},
+        "grid": {"left": 46, "right": 18, "top": 40, "bottom": 62},
+        "xAxis": {"type": "category", "data": [s.get("赛季", "") for s in d],
+                  "axisLabel": {"rotate": 35, "fontSize": 10, "color": "#6b7280"}},
+        "yAxis": {"type": "value", "splitLine": _GRID},
+        "series": [
+            {"name": "上场", "type": "bar", "data": n("上场"),
+             "itemStyle": {"color": "#e6ebf2", "borderRadius": [3, 3, 0, 0]}},
+            {"name": "进球", "type": "line", "smooth": True, "data": n("进球"),
+             "itemStyle": {"color": _RED}, "lineStyle": {"width": 3}},
+            {"name": "助攻", "type": "line", "smooth": True, "data": n("助攻"),
+             "itemStyle": {"color": _RED2}, "lineStyle": {"width": 2}},
+        ],
+    }
+
+
 # ------------------------- UI（仅在 streamlit 运行时执行） -------------------
 def main():
-    st.set_page_config(page_title="懂球帝评论爬取 Demo", page_icon="⚽", layout="wide")
+    st.set_page_config(page_title="懂球帝 · 评论爬取 + 数据分析", page_icon="⚽", layout="wide")
     st.markdown(CSS, unsafe_allow_html=True)
+    st.markdown(render_hero(), unsafe_allow_html=True)
 
+    # ---- 顶部功能切换：功能一 评论爬取 / 功能二 数据分析 ----
+    mode = st.pills("功能", ["📰 评论爬取", "📊 数据分析"], selection_mode="single",
+                    default="📰 评论爬取", key="app_mode", label_visibility="collapsed")
+    if mode and "数据分析" in mode:
+        page_data()
+    else:
+        page_scrape()
+
+
+def page_scrape():
+    """功能一：新闻评论爬取 + 词云 + 情感分析。"""
     # ---- session state ----
     for key in ("news", "selected", "sel_title", "results"):
         if key not in st.session_state:
@@ -892,8 +1072,6 @@ def main():
     _qp_sel = st.query_params.get("sel")
     if _qp_sel and not st.session_state.selected:
         st.session_state.selected = str(_qp_sel)
-
-    st.markdown(render_hero(), unsafe_allow_html=True)
 
     # ---- 首次自动拉取真实新闻 ----
     if st.session_state.news is None:
@@ -1205,6 +1383,193 @@ def main():
 
     st.markdown('<div class="dqd-foot">数据来自懂球帝公开页面，仅供学习研究使用。</div>',
                 unsafe_allow_html=True)
+
+
+def page_data():
+    """功能二：联赛 / 球队 / 球员 全方位数据分析（ECharts）。"""
+    st.markdown('<div class="dqd-section-title">📊 数据分析 · 联赛 / 球队 / 球员</div>',
+                unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1.6], gap="medium")
+    with c1:
+        grp = st.selectbox("分组", list(LEAGUE_GROUPS.keys()), key="dt_group")
+    with c2:
+        league = st.selectbox("联赛", LEAGUE_GROUPS[grp], key="dt_league")
+    with c3:
+        st.caption("数据来自懂球帝公开数据页；同一联赛首次加载约 1 秒，之后走缓存。")
+        if st.button("🔄 重新拉取数据", key="dt_reload", width="stretch"):
+            st.session_state.data_cache = {}
+            st.rerun()
+
+    cid = DD.ALL_LEAGUES.get(league)
+    if not cid:
+        st.warning("该联赛暂无数据。")
+        return
+    try:
+        with st.spinner(f"正在加载「{league}」数据…"):
+            st_rows = _cached(f"st_{cid}", DD.fetch_standings, cid)
+            sc_rows = _cached(f"sc_{cid}", DD.fetch_person_rank, cid)
+            _cached(f"tm_{cid}", DD.fetch_team_goals, cid)
+    except Exception as e:  # noqa: BLE001
+        st.error(f"数据加载失败：{type(e).__name__}: {e}")
+        return
+    if not st_rows:
+        st.info(f"「{league}」暂无积分榜数据（赛事可能未开始 / 已结束）。")
+        return
+    st_rows = DD.enrich_standings(st_rows)
+
+    tot_gf = sum(r["进球"] for r in st_rows)
+    played = sum(r["赛"] for r in st_rows) // 2
+    st.markdown(render_stat_tiles([
+        (len(st_rows), f"{league} 参赛队", "red"),
+        (played, "已赛场次", ""),
+        (tot_gf, "总进球", ""),
+        (round(tot_gf / max(1, played), 2), "场均进球", ""),
+    ]), unsafe_allow_html=True)
+
+    t1, t2, t3, t4, t5 = st.tabs(["📋 积分榜", "⚽ 射手榜", "⚖️ 球队对比",
+                                  "🏟️ 球队详情", "👤 球员详情"])
+
+    # ---------- 1) 积分榜 ----------
+    with t1:
+        cc1, cc2 = st.columns(2, gap="large")
+        with cc1:
+            with st.container(border=True, key="dt_p_points"):
+                st.markdown(render_h("积分 Top 12"), unsafe_allow_html=True)
+                echarts(chart_points(st_rows, 12), 360)
+        with cc2:
+            with st.container(border=True, key="dt_p_goals"):
+                st.markdown(render_h("进 / 失球对比 Top 10"), unsafe_allow_html=True)
+                echarts(chart_goals(st_rows, 10), 360)
+        with st.container(border=True, key="dt_p_table"):
+            st.markdown(render_h("积分榜明细（含场均指标）"), unsafe_allow_html=True)
+            df = pd.DataFrame(st_rows)[["排名", "球队", "赛", "胜", "平", "负", "进球",
+                                        "失球", "净胜", "积分", "场均积分", "场均进球",
+                                        "场均失球", "胜率"]]
+            st.dataframe(df, width="stretch", height=430, hide_index=True)
+
+    # ---------- 2) 射手榜 ----------
+    with t2:
+        if not sc_rows:
+            st.info("暂无球员榜单数据。")
+        else:
+            cc1, cc2 = st.columns([1.35, 1], gap="large")
+            with cc1:
+                with st.container(border=True, key="dt_p_scorers"):
+                    st.markdown(render_h("射手榜 Top 15"), unsafe_allow_html=True)
+                    echarts(chart_scorers(sc_rows, 15), 430)
+            with cc2:
+                with st.container(border=True, key="dt_p_pie"):
+                    st.markdown(render_h("进球来源球队分布"), unsafe_allow_html=True)
+                    agg = {}
+                    for r in sc_rows:
+                        agg[r["球队"]] = agg.get(r["球队"], 0) + r["进球"]
+                    echarts(chart_pie(list(agg.items()), 8), 430)
+            with st.container(border=True, key="dt_p_scoretable"):
+                st.markdown(render_h("射手榜明细"), unsafe_allow_html=True)
+                st.dataframe(pd.DataFrame(sc_rows)[["排名", "球员", "球队", "进球"]],
+                             width="stretch", height=400, hide_index=True)
+
+    # ---------- 3) 球队对比 ----------
+    with t3:
+        names_all = [r["球队"] for r in st_rows]
+        pick = st.multiselect("选择要对比的球队（默认前 6 名）", names_all,
+                              default=names_all[:6], key="dt_cmp")
+        if pick:
+            with st.container(border=True, key="dt_p_cmp"):
+                st.markdown(render_h("球队指标对比：积分 / 进球 / 失球"), unsafe_allow_html=True)
+                echarts(chart_compare(st_rows, pick), 400)
+            sub = [r for r in st_rows if r["球队"] in pick]
+            st.dataframe(pd.DataFrame(sub)[["排名", "球队", "赛", "胜", "平", "负", "进球",
+                                            "失球", "净胜", "积分", "场均积分", "场均进球",
+                                            "场均失球", "胜率"]],
+                         width="stretch", hide_index=True)
+        else:
+            st.info("请至少选择一支球队。")
+
+    # ---------- 4) 球队详情 ----------
+    with t4:
+        teams = [r for r in st_rows if r.get("team_id")]
+        if not teams:
+            st.info("暂无球队 ID，无法加载球队详情。")
+        else:
+            tn = st.selectbox("选择球队", [r["球队"] for r in teams], key="dt_team")
+            row = next(r for r in teams if r["球队"] == tn)
+            st.markdown(render_stat_tiles([
+                (f"第 {row['排名']} 名", "当前排名", "red"),
+                (row["积分"], "积分", ""),
+                (f"{row['胜']}胜{row['平']}平{row['负']}负", "战绩", ""),
+                (f"{row['进球']}/{row['失球']}", "进 / 失球", ""),
+            ]), unsafe_allow_html=True)
+            cL, cR = st.columns(2, gap="large")
+            with cL:
+                with st.container(border=True, key="dt_p_teamplayers"):
+                    st.markdown(render_h("该队射手榜球员"), unsafe_allow_html=True)
+                    tp = [r for r in sc_rows if r["球队"] == tn]
+                    if tp:
+                        echarts(chart_scorers(tp, min(10, len(tp))), 320)
+                    else:
+                        st.caption("该队暂无球员进入射手榜。")
+            with cR:
+                with st.container(border=True, key="dt_p_teamnews"):
+                    st.markdown(render_h("球队近期新闻"), unsafe_allow_html=True)
+                    try:
+                        tinfo = _cached(f"team_{row['team_id']}", DD.fetch_team,
+                                        row["team_id"])
+                    except Exception:  # noqa: BLE001
+                        tinfo = {"news": []}
+                    if tinfo.get("news"):
+                        for n in tinfo["news"][:8]:
+                            st.markdown(
+                                f'<div class="dqd-hot"><div class="c">{esc(n["title"])}</div>'
+                                f'<div class="m">🗞️ 文章 ID：{n["id"]}</div></div>',
+                                unsafe_allow_html=True)
+                    else:
+                        st.caption("暂无该队新闻。")
+            st.caption("提示：想分析某条新闻的评论，可切到「📰 评论爬取」，"
+                       "用「按链接 / 文章 ID 直接打开」粘贴上面的文章 ID。")
+
+    # ---------- 5) 球员详情 ----------
+    with t5:
+        opts = {f"{r['球员']}（{r['球队']} · {r['进球']}球）": r
+                for r in sc_rows if r.get("player_id")}
+        if not opts:
+            st.info("暂无可选球员（需要射手榜数据）。")
+        else:
+            label = st.selectbox("选择球员（射手榜）", list(opts.keys()), key="dt_player")
+            sel = opts[label]
+            try:
+                with st.spinner("正在加载球员数据…"):
+                    info = _cached(f"pl_{sel['player_id']}", DD.fetch_player,
+                                   sel["player_id"])
+            except Exception as e:  # noqa: BLE001
+                st.error(f"球员数据加载失败：{type(e).__name__}: {e}")
+                return
+            meta = info.get("info") or {}
+            st.markdown(render_stat_tiles([
+                (sel["球员"], "球员", "red"),
+                (sel["球队"], "效力球队", ""),
+                (meta.get("身价", "—"), "身价", ""),
+                (meta.get("国籍", "—"), "国籍", ""),
+            ]), unsafe_allow_html=True)
+            seasons = info.get("seasons") or []
+            matches = info.get("matches") or []
+            if seasons:
+                with st.container(border=True, key="dt_p_pltrend"):
+                    st.markdown(render_h("多赛季数据趋势（上场 / 进球 / 助攻）"),
+                                unsafe_allow_html=True)
+                    echarts(chart_player_seasons(seasons, 10), 370)
+                with st.container(border=True, key="dt_p_pltable"):
+                    st.markdown(render_h("赛季数据明细"), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(seasons), width="stretch", height=320,
+                                 hide_index=True)
+            if matches:
+                with st.container(border=True, key="dt_p_plmatches"):
+                    st.markdown(render_h("近期比赛记录"), unsafe_allow_html=True)
+                    st.dataframe(pd.DataFrame(matches), width="stretch", height=320,
+                                 hide_index=True)
+            if not seasons and not matches:
+                st.info("该球员暂无详细数据。")
 
 
 PLACEHOLDER_COVER = (
