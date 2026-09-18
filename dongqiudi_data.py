@@ -721,13 +721,16 @@ def _pois(k, lam):
 
 
 def poisson_predict(home_ability, home_form, away_ability, away_form,
-                    baseline=1.35, max_goals=8, form_weight=0.4, shrink=0.65):
+                    baseline=1.35, max_goals=8, form_weight=0.4, shrink=0.65,
+                    home_adv=1.10):
     """用「能力值 + 近期状态」混合出攻防强度，再用泊松分布算胜平负与比分概率。
 
     · 进攻强度 = (1-w)*能力进攻指数系数 + w*近期场均进球相对联赛基线的倍数
     · 防守强度 = (1-w)*能力防守指数系数 + w*(联赛基线/近期场均失球)  ← 失球越少越强
-    · λ_主 = 基线 * 1.10(主场) * 主攻 / 客防
-      λ_客 = 基线 / 1.10      * 客攻 / 主防
+    · λ_主 = 基线 * home_adv * 主攻 / 客防
+      λ_客 = 基线 / home_adv * 客攻 / 主防
+    `home_adv` 为主场优势系数：默认 1.10（主客场制）；**传 1.0 即中立场**
+    （两队期望进球都不再含主场加成）。
     近期数据样本小、噪声大，故对「相对均值的偏离」做 shrink 收缩（默认 0.65，
     即偏离量只取 65%），避免 6 场 2.5 个失球就把期望进球放大到 4 球以上。
     这是启发性估计，不是官方赔率，仅供参考。
@@ -735,6 +738,7 @@ def poisson_predict(home_ability, home_form, away_ability, away_form,
     hs = team_strength_index(home_ability)
     as_ = team_strength_index(away_ability)
     base = float(baseline or 1.35)
+    adv = float(home_adv or 1.0)
 
     def _shrunk(m):
         return 1.0 + shrink * (m - 1.0)
@@ -759,8 +763,8 @@ def poisson_predict(home_ability, home_form, away_ability, away_form,
 
     h_atk, h_def = atk_mult(hs, home_form), def_mult(hs, home_form)
     a_atk, a_def = atk_mult(as_, away_form), def_mult(as_, away_form)
-    lam_h = max(0.15, min(3.6, base * 1.10 * h_atk / max(0.4, a_def)))
-    lam_a = max(0.15, min(3.6, base / 1.10 * a_atk / max(0.4, h_def)))
+    lam_h = max(0.15, min(3.6, base * adv * h_atk / max(0.4, a_def)))
+    lam_a = max(0.15, min(3.6, base / adv * a_atk / max(0.4, h_def)))
 
     n = max_goals + 1
     grid = [[_pois(i, lam_h) * _pois(j, lam_a) for j in range(n)] for i in range(n)]
@@ -786,6 +790,7 @@ def poisson_predict(home_ability, home_form, away_ability, away_form,
         },
         "form_weight": form_weight,
         "baseline": base,
+        "home_adv": adv,
     }
 
 

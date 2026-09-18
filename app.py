@@ -915,6 +915,12 @@ _RT_OPTS = {
     "整个赛季（全部已结束场次）": None,
 }
 
+# 赛果预测：场地 → 主场优势系数（1.0 = 中立场，双方都无加成）
+_VENUES = {
+    "🏠 主客场（A 队主场）": 1.10,
+    "⚖️ 中立场（无主场优势）": 1.0,
+}
+
 
 def echarts(option, height=380):
     """渲染一个 ECharts 图表。
@@ -1339,7 +1345,11 @@ def chart_win_prob(pred, home_name, away_name):
 
 
 def chart_score_matrix(pred, home_name, away_name, nmax=5):
-    """比分概率热力图（0~nmax 球）。"""
+    """比分概率热力图（0~nmax 球）。
+
+    注意：热力图 data 是 [x, y, 值] 数组，`label.formatter` 里 `{c}` 会把整个数组
+    打出来（如 "0,0,6.1%"），必须用 **`{@[2]}`** 取第 3 维才是干净的百分比。
+    """
     n = nmax + 1
     grid = pred.get("grid") or []
     data = []
@@ -1350,24 +1360,24 @@ def chart_score_matrix(pred, home_name, away_name, nmax=5):
     hi = max((d[2] for d in data), default=1) or 1
     return {
         "tooltip": {"trigger": "item"},
-        "grid": {"left": 58, "right": 20, "top": 18, "bottom": 66},
+        "grid": {"left": 58, "right": 74, "top": 18, "bottom": 52},
         "xAxis": {"type": "category", "data": [str(i) for i in range(n)],
                   "name": f"{home_name} 进球", "nameLocation": "middle",
-                  "nameGap": 28, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
+                  "nameGap": 26, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
                   "splitArea": {"show": True}},
         "yAxis": {"type": "category", "data": [str(j) for j in range(n)],
                   "name": f"{away_name} 进球", "nameLocation": "middle",
-                  "nameGap": 38, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
+                  "nameGap": 34, "nameTextStyle": {"fontSize": 11, "color": "#6b7280"},
                   "splitArea": {"show": True}},
         "visualMap": {"min": 0, "max": round(hi, 1), "calculable": True,
-                      "orient": "horizontal", "left": "center", "bottom": 4,
-                      "itemWidth": 12, "itemHeight": 90,
+                      "orient": "vertical", "right": 6, "top": "center",
+                      "itemWidth": 12, "itemHeight": 100, "precision": 1,
                       "textStyle": {"fontSize": 10, "color": "#6b7280"},
                       "inRange": {"color": ["#fff7f7", "#fbd5d5", "#ef8a8a",
                                             "#d51d2a", "#7d0c16"]}},
         "series": [{"type": "heatmap", "data": data,
-                    "label": {"show": True, "fontSize": 9, "color": "#15181d",
-                              "formatter": "{c}%"},
+                    "label": {"show": True, "fontSize": 9.5, "color": "#15181d",
+                              "formatter": "{@[2]}%"},
                     "emphasis": {"itemStyle": {"shadowBlur": 8,
                                                "shadowColor": "rgba(0,0,0,.28)"}}}],
     }
@@ -2206,22 +2216,32 @@ def page_data():
                    "**进攻 / 防守 / 门将指数**，再与两队**近期场均进失球**按权重混合"
                    "（小样本噪声已做向均值收缩），得到各自的期望进球；"
                    "最后用**泊松分布**算出胜平负与各比分的概率。"
-                   "「近期状态权重」可调：0% 完全看能力值，100% 更看重近期战绩。")
+                   "「近期状态权重」可调：0% 完全看能力值，100% 更看重近期战绩。"
+                   "场地可选**主客场**（含主场优势）或**中立场**（如世界杯 / 决赛 / "
+                   "第三方球场，双方均无主场加成）。")
         names_all = [r["球队"] for r in st_rows]
         tmap = {r["球队"]: r.get("team_id") for r in st_rows}
         if len(names_all) < 2:
             st.info("该联赛球队不足 2 支，无法做赛果预测。")
         else:
-            c1, c2, c3 = st.columns([1.1, 1.1, 1], gap="medium")
+            c0, c1, c2 = st.columns([1.05, 1.05, 1.05], gap="medium")
+            with c0:
+                venue = st.selectbox("场地", list(_VENUES.keys()), index=0,
+                                     key="pd_venue",
+                                     help="中立场 = 双方都没有主场优势"
+                                          "（世界杯、杯赛决赛、第三方球场等场景）")
+            neutral = _VENUES[venue] == 1.0
             with c1:
-                hname = st.selectbox("主队", names_all, index=0, key="pd_home")
+                hname = st.selectbox("A 队" if neutral else "主队", names_all,
+                                     index=0, key="pd_home")
             with c2:
-                aname = st.selectbox("客队", names_all, index=1, key="pd_away")
+                aname = st.selectbox("B 队" if neutral else "客队", names_all,
+                                     index=1, key="pd_away")
             hid, aid = tmap.get(hname), tmap.get(aname)
+            c3, c4, c5 = st.columns([1.05, 1.05, 1.05], gap="medium")
             with c3:
                 season, season_label = (_season_picker(hid, "pd_season")
                                         if hid else (None, ""))
-            c4, c5 = st.columns([1, 1], gap="medium")
             with c4:
                 fw = st.slider("近期状态权重（%）", 0, 100, 40, 5, key="pd_formw")
             with c5:
@@ -2231,7 +2251,7 @@ def page_data():
             if not hid or not aid:
                 st.info("缺少球队 ID，无法预测。")
             elif hname == aname:
-                st.warning("主队和客队不能是同一支球队。")
+                st.warning("A 队和 B 队不能是同一支球队。")
             else:
                 base = DD.league_goal_baseline(st_rows)
                 try:
@@ -2243,18 +2263,27 @@ def page_data():
                     hp = ap = {}
                 pred = DD.poisson_predict(hp.get("ability") or {}, hp.get("form") or {},
                                           ap.get("ability") or {}, ap.get("form") or {},
-                                          baseline=base, form_weight=fw / 100.0)
+                                          baseline=base, form_weight=fw / 100.0,
+                                          home_adv=_VENUES[venue])
+                venue_txt = ("中立场（无主场加成）" if neutral
+                             else f"主客场（{hname} 主场，加成 ×{_VENUES[venue]}）")
                 best = pred["top_scores"][0]["score"] if pred["top_scores"] else "—"
                 st.markdown(render_stat_tiles([
-                    (f"{pred['p_home']}%", f"{hname} 胜", "red"),
+                    (f"{pred['p_home']}%", f"{hname} 胜" + ("（中立）" if neutral else ""),
+                     "red"),
                     (f"{pred['p_draw']}%", "平局", ""),
-                    (f"{pred['p_away']}%", f"{aname} 胜", ""),
+                    (f"{pred['p_away']}%", f"{aname} 胜" + ("（中立）" if neutral else ""),
+                     ""),
                     (best, "最可能比分", "red"),
                 ]), unsafe_allow_html=True)
-                st.caption(f"期望进球　{hname} **{pred['lambda_home']}** ／ {aname} "
-                           f"**{pred['lambda_away']}**　·　联赛基线（每队每场）"
-                           f"{base} 球　·　近期状态权重 {fw}%　·　赛季 "
-                           f"{season_label or '当前'}")
+                st.caption(f"场地　**{venue_txt}**　·　期望进球　{hname} "
+                           f"**{pred['lambda_home']}** ／ {aname} **{pred['lambda_away']}**"
+                           f"　·　联赛基线（每队每场）{base} 球　·　近期状态权重 {fw}%"
+                           f"　·　赛季 {season_label or '当前'}")
+                if neutral:
+                    st.caption("⚖️ 中立场：两队期望进球都**不含主场加成**，"
+                               "胜平负由攻防强度与近期状态直接决定；"
+                               "切换成「主客场」即可对比同一对阵在主场时的差异。")
 
                 p1, p2 = st.columns([1, 1.2], gap="large")
                 with p1:
@@ -2267,8 +2296,9 @@ def page_data():
                             width="stretch", hide_index=True, height=230)
                 with p2:
                     with st.container(border=True, key="pd_matrix"):
-                        st.markdown(render_h("比分概率矩阵（行=客队进球，列=主队进球）"),
-                                    unsafe_allow_html=True)
+                        st.markdown(render_h(
+                            f"比分概率矩阵（行={aname} 进球，列={hname} 进球）"),
+                            unsafe_allow_html=True)
                         echarts(chart_score_matrix(pred, hname, aname), 430)
 
                 hs, as_ = pred["strength"]["home"], pred["strength"]["away"]
@@ -2281,6 +2311,9 @@ def page_data():
                         return "—" if v is None or v == "" else str(v)
 
                     st.dataframe(pd.DataFrame([
+                        {"项目": "主场加成系数（1.0 = 中立场）",
+                         hname: f"×{pred.get('home_adv')}",
+                         aname: f"×{round(1 / (pred.get('home_adv') or 1), 3)}"},
                         {"项目": "球队能力评分（首发11人均值）",
                          hname: _s(hab.get("team_avg")), aname: _s(aab.get("team_avg"))},
                         {"项目": "进攻指数", hname: _s(hs.get("attack")),
@@ -2301,7 +2334,10 @@ def page_data():
                          aname: _s(as_.get("atk_mult"))},
                         {"项目": "防守系数（越大越稳）", hname: _s(hs.get("def_mult")),
                          aname: _s(as_.get("def_mult"))},
-                    ]), width="stretch", hide_index=True, height=396)
+                        {"项目": "期望进球 λ（本次结果）",
+                         hname: _s(pred.get("lambda_home")),
+                         aname: _s(pred.get("lambda_away"))},
+                    ]), width="stretch", hide_index=True, height=430)
 
                 hia = hab.get("indicators_avg") or []
                 aia = aab.get("indicators_avg") or []
