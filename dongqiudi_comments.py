@@ -9,13 +9,16 @@
   输出为 JSON（按文章分文件）和一份合并的 CSV。
 
 接口说明（实测 2026-09）：
-  - 主接口（网页版）：https://api.dongqiudi.com/comment/list/{id}?plat=web&page=N&count=50
-        返回字段更完整（含 user.username / like / sub_comment_count 等）。
-        注意：该接口有反爬，需要带浏览器 UA + Referer，否则返回 403。
-  - 兜底接口（App 老版）：https://api.dongqiudi.com/v2/article/{id}/comment?sort=down&version=177
-        已验证可用，返回 content / created_at / id / comment_statement_list（表情统计）
-        以及 next（下一页 URL，含时间戳）。但该接口的主评论**不含作者名**。
-  本脚本优先尝试主接口；若失败（403 / 异常 / 无评论字段）则自动回退到兜底接口。
+  - 主接口（App v2）：https://api.dongqiudi.com/v2/article/{id}/comment?sort=down&version=177
+        **可翻页拿全量顶级评论**（响应里的 next 即下一页 URL，翻到 next 为空为止）。
+        字段：id / content / created_at(绝对时间) / user_id / up_count(点赞) /
+              reply_total(回复数) / iptext(地区)；用户名在 user_list 里按 id 映射
+              （实测覆盖率 100%）。
+  - 兜底（文章页服务端渲染）：https://www.dongqiudi.com/articles/{id}.html
+        页面内直接渲染约第一页评论（约 100 条），含用户名/点赞/相对时间。
+        v2 不可用时（例如部署环境 IP 被拦）走这条。
+  - 已废弃：https://api.dongqiudi.com/comment/list/{id}?plat=web  —— 不带 Referer 也 403。
+  本脚本优先走 v2 接口；失败则回退文章页解析。
 
 使用：
   # 直接传文章 ID
@@ -106,24 +109,8 @@ def fetch_json(url, timeout=15, retries=3):
 
 # ----------------------------- 单篇文章爬取 ----------------------------------
 
-def _normalize_web(raw, user_map):
-    user = raw.get("user") or {}
-    uid = user.get("id")
-    username = user.get("username")
-    # 极端情况下用户对象可能只在 user_map 里
-    if (not username) and uid and str(uid) in user_map:
-        username = user_map.get(str(uid))
-    return {
-        "comment_id": str(raw.get("id")),
-        "content": raw.get("content", ""),
-        "username": username,
-        "user_id": str(uid) if uid is not None else None,
-        "like_count": raw.get("like"),
-        "created_at": raw.get("created_at"),
-        "sub_comment_count": raw.get("sub_comment_count"),
-        "emoji_stats": raw.get("comment_statement_list") or raw.get("comment_like_list"),
-        "source": "web",
-    }
+# 注：原「网页版评论接口」(api.dongqiudi.com/comment/list) 已废弃（实测不带
+# Referer 也 403），对应的 _normalize_web 已删除，避免留死代码。
 
 
 def _normalize_v2(raw, user_map):
@@ -136,10 +123,12 @@ def _normalize_v2(raw, user_map):
         "content": raw.get("content", ""),
         "username": username,
         "user_id": str(uid) if uid is not None else None,
-        "like_count": None,
+        # v2 的点赞字段叫 up_count、回复数字段叫 reply_total（早期误当成没有，已修正）
+        "like_count": raw.get("up_count") if raw.get("up_count") is not None else 0,
         "created_at": raw.get("created_at"),
-        "sub_comment_count": None,
+        "sub_comment_count": raw.get("reply_total"),
         "emoji_stats": raw.get("comment_statement_list"),
+        "location": raw.get("iptext"),
         "source": "v2",
     }
 
@@ -274,112 +263,89 @@ def crawl_from_article_page(article_id, timeout=25, reasons=None):
     return _parse_page_comments(html, article_id)
 
 
-def crawl_article(article_id, max_pages=200, request_delay=0.5):
+def crawl_article(article_id, max_pages=200, request_delay=0.2):
     """
     爬取单篇文章的全部评论。
 
-    优先级：
-      0) 文章页 www/m.dongqiudi.com/articles/{id}.html（服务端渲染真实评论，
-         与新闻首页同域，通常未被 WAF 拦截，部署环境也可用）→ source="webpage"
-      1) 网页版接口 api.dongqiudi.com/comment/list（带 Referer）→ source="web"
-      2) App 老接口 api.dongqiudi.com/v2/article/{id}/comment → source="v2"
+    优先级（实测 2026-09 确定）：
+      0) App v2 接口 api.dongqiudi.com/v2/article/{id}/comment
+         —— 可**翻页拿全量顶级评论**，且含用户名（user_list 映射）、
+            点赞（up_count）、回复数（reply_total）、绝对时间、地区（iptext）
+         → source="v2"
+      1) 文章页 www/m.dongqiudi.com/articles/{id}.html 服务端渲染评论
+         —— 只渲染第一页（约 100 条），但同域、Cloud 上通常不被拦，作兜底
+         → source="webpage"
       全部失败 → source="failed"（调用方据此回退示例数据）
 
-    返回 dict: {"article_id", "source", "total", "comments": [...]}
+    注：网页版评论接口 api.dongqiudi.com/comment/list 已废弃（不带 Referer 也 403），已移除。
+
+    返回 dict: {"article_id", "source", "total", "comments": [...], "reported_total"}
+      reported_total = 接口自报的总数（含二级回复），用于诚实展示"是否全量"。
     """
+    aid = str(article_id)
     reasons = []
 
-    # ---- 0) 文章页内嵌真实评论（首选，部署环境通常可用）----
+    # ---- 0) App v2 接口翻页（首选：可拿到全量顶级评论）----
     try:
-        page_comments, total = crawl_from_article_page(article_id, reasons=reasons)
-        if page_comments:
-            return {
-                "article_id": str(article_id),
-                "source": "webpage",
-                "total": total or len(page_comments),
-                "comments": page_comments,
-            }
-        if total == 0:
-            # 文章页可访问且确实 0 评论：返回真实空结果，不回退演示
-            return {
-                "article_id": str(article_id),
-                "source": "webpage",
-                "total": 0,
-                "comments": [],
-            }
-    except Exception as e:  # noqa: BLE001
-        print(f"  [文章页评论解析失败: {e}，尝试接口]", file=sys.stderr)
-
-    # ---- 1) 尝试网页版接口 ----
-    web_comments = []
-    try:
-        page = 1
-        while page <= max_pages:
-            url = (
-                f"{WEB_HOST}/comment/list/{article_id}?"
-                f"plat=web&page={page}&count=50"
-            )
-            data = fetch_json(url)
-            cl = (data.get("data") or {}).get("comment_list") or []
-            if not cl:
-                break
-            for c in cl:
-                web_comments.append(_normalize_web(c, {}))
-            if len(cl) < 50:
-                break
-            page += 1
-            time.sleep(request_delay + random.uniform(0, 0.3))
-        if web_comments:
-            return {
-                "article_id": str(article_id),
-                "source": "web",
-                "total": len(web_comments),
-                "comments": web_comments,
-            }
-    except Exception as e:  # noqa: BLE001
-        reasons.append(f"网页版接口: {type(e).__name__}: {e}")
-        print(f"  [网页版接口不可用: {e}，回退 v2 接口]", file=sys.stderr)
-
-    # ---- 2) 回退 v2 接口 ----
-    v2_comments = []
-    user_map = {}
-    try:
-        next_url = (
-            f"{WEB_HOST}/v2/article/{article_id}/comment?"
-            f"sort=down&version={APP_VERSION}"
-        )
+        url = f"{WEB_HOST}/v2/article/{aid}/comment?sort=down&version={APP_VERSION}"
+        raw_list, user_map, reported = [], {}, None
         pages = 0
-        while next_url and pages < max_pages:
-            data = fetch_json(next_url)
+        while url and pages < max_pages:
+            data = fetch_json(url)
             d = data.get("data") or {}
-            # 建立 user_map（v2 把用户名单独列出，部分评论可能带 user_id 可关联）
+            if reported is None and d.get("comment_total") is not None:
+                reported = d.get("comment_total")
             for u in d.get("user_list") or []:
-                user_map[str(u.get("id"))] = u.get("username")
+                uid = u.get("id")
+                if uid is not None and u.get("username"):
+                    user_map[str(uid)] = u["username"]
             cl = d.get("comment_list") or []
             if not cl:
                 break
-            for c in cl:
-                v2_comments.append(_normalize_v2(c, user_map))
-            nxt = d.get("next")
-            if not nxt:
-                break
-            next_url = nxt
+            raw_list.extend(cl)
+            url = d.get("next")
             pages += 1
-            time.sleep(request_delay + random.uniform(0, 0.3))
-        if v2_comments:
+            if url:
+                time.sleep(request_delay)
+
+        if raw_list:
+            # user_map 需收集完整后再归一化，保证用户名映射尽量全命中
+            seen, comments = set(), []
+            for c in raw_list:
+                cid = str(c.get("id"))
+                if cid in seen:
+                    continue
+                seen.add(cid)
+                comments.append(_normalize_v2(c, user_map))
             return {
-                "article_id": str(article_id),
+                "article_id": aid,
                 "source": "v2",
-                "total": len(v2_comments),
-                "comments": v2_comments,
+                "total": len(comments),
+                "comments": comments,
+                "reported_total": reported,
             }
     except Exception as e:  # noqa: BLE001
         reasons.append(f"App v2 接口: {type(e).__name__}: {e}")
-        print(f"  [v2 接口也失败: {e}]", file=sys.stderr)
+        print(f"  [v2 接口不可用: {e}，回退文章页]", file=sys.stderr)
 
-    # ---- 3) 全部失败 ----
+    # ---- 1) 文章页服务端渲染评论（兜底，只含第一页）----
+    try:
+        page_comments, page_total = crawl_from_article_page(aid, reasons=reasons)
+        if page_comments or page_total == 0:
+            return {
+                "article_id": aid,
+                "source": "webpage",
+                "total": len(page_comments),
+                "comments": page_comments,
+                "reported_total": page_total,
+            }
+    except Exception as e:  # noqa: BLE001
+        reasons.append(f"文章页: {type(e).__name__}: {e}")
+        print(f"  [文章页评论解析失败: {e}]", file=sys.stderr)
+
+    # ---- 2) 全部失败 ----
     return {
-        "article_id": str(article_id),
+        "article_id": aid,
         "source": "failed",
         "total": 0,
         "comments": [],
@@ -391,7 +357,7 @@ def crawl_article(article_id, max_pages=200, request_delay=0.5):
 
 CSV_FIELDS = [
     "article_id", "comment_id", "username", "user_id", "content",
-    "like_count", "sub_comment_count", "created_at", "emoji_stats", "source",
+    "like_count", "sub_comment_count", "created_at", "location", "emoji_stats", "source",
 ]
 
 

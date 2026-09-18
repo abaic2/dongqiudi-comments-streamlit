@@ -22,6 +22,7 @@ import re
 import ssl
 import sys
 import json
+import gzip
 import urllib.request
 from datetime import datetime
 
@@ -103,7 +104,7 @@ SAMPLE = {
     ]
 }
 
-SOURCE_LABEL = {"webpage": "懂球帝网页", "web": "网页版接口", "v2": "App 接口", "sample": "示例数据"}
+SOURCE_LABEL = {"v2": "App 接口（全量）", "webpage": "网页首屏", "sample": "示例数据"}
 
 STOPWORDS = set(
     "的 了 是 在 我 你 他 她 它 我们 你们 他们 这 那 这个 那个 也 都 就 还 和 与 及 等 被 把 让 给 "
@@ -169,45 +170,107 @@ WORD_RE = re.compile("(" + "|".join(re.escape(w) for w in _ALL_WORDS) + ")")
 
 
 # ------------------------- 新闻列表获取（点选爬取） -------------------------
+def _read_body(r):
+    """读取响应体，自动处理 gzip。"""
+    raw = r.read()
+    if raw[:2] == b"\x1f\x8b":
+        raw = gzip.decompress(raw)
+    return raw.decode("utf-8", "ignore")
+
+
 def _http_get_json(url, headers):
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
-        return json.loads(r.read().decode("utf-8", "ignore"))
+        return json.loads(_read_body(r))
 
 
 def _http_get_text(url, headers):
     req = urllib.request.Request(url, headers=headers)
     ctx = ssl.create_default_context()
     with urllib.request.urlopen(req, timeout=12, context=ctx) as r:
-        return r.read().decode("utf-8", "ignore")
+        return _read_body(r)
+
+
+# App tab feed（实测有内容且去重后量最大的 tab）：
+# 1=头条 3=英超 4=意甲 5=西甲 6=德甲 11=集锦 12=法甲 13=综合 37=闲情
+APP_FEED_TABS = [1, 3, 4, 5, 6, 11, 12, 13, 37]
+
+
+def parse_feed(data):
+    """从 App tab feed JSON 抽取文章列表（含封面 / 分类 / 评论数）。"""
+    out = []
+    for it in (data or {}).get("articles") or []:
+        if not isinstance(it, dict):
+            continue
+        aid = it.get("id")
+        title = it.get("title") or it.get("share_title")
+        if not aid or not title:
+            continue
+        cover = it.get("thumb")
+        if cover and not str(cover).startswith("http"):
+            cover = None
+        out.append({
+            "id": str(aid),
+            "title": str(title).strip(),
+            "cover": cover,
+            "time": fmt_time(it.get("published_at") or it.get("created_at")),
+            "raw_time": it.get("sort_timestamp") or it.get("created_at"),
+            "tag": str(it.get("category") or ""),
+            "comments": it.get("comments_total"),
+        })
+    return out
 
 
 def fetch_news_list():
-    """获取懂球帝实时新闻列表（真实数据源：官网首页 HTML）。
+    """获取懂球帝实时新闻列表（实测可拿到 80+ 条）。
+
+    主源：App tab feed `api.dongqiudi.com/app/tabs/iphone/{tab}.json`
+          遍历多个内容 tab（头条/英超/意甲/西甲/德甲/集锦/法甲/综合/闲情）后去重。
+          注：该接口的 prev/page/before 参数实测**不会真正翻页**（永远返回同一页），
+              所以靠"多 tab"而不是"翻页"来扩量。
+    兜底：官网首页 HTML（约 25 条）
+    再失败 → 内置示例
 
     返回 (news_list, is_demo)：
-      - 官网首页抓到文章 -> (真实列表, False)
-      - 全部失败 -> (内置示例, True)，由调用方显示 ⚠️ 横幅，绝不假装实时。
-
-    重要：之前猜的 api.dongqiudi.com 新闻接口已全部 403（实测确认），
-    官网首页是公开页面、服务端渲染带 /articles/{id}.html 链接，最稳。
+      - 抓到文章 -> (真实列表, False)
+      - 全部失败 -> (内置示例, True)，由调用方显示 ⚠️，绝不假装实时。
     """
     headers = {
         "User-Agent": (
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9",
     }
-    # 官网首页（PC + 移动）依次尝试；任一拿到文章即视为真实数据
+
+    # ---- 主源：多个 tab 合并去重（单 tab 失败不影响其它）----
+    arts, seen = [], set()
+    for tab in APP_FEED_TABS:
+        try:
+            data = _http_get_json(
+                f"https://api.dongqiudi.com/app/tabs/iphone/{tab}.json?version=177",
+                headers,
+            )
+        except Exception:  # noqa: BLE001
+            continue
+        for a in parse_feed(data):
+            if a["id"] in seen:
+                continue
+            seen.add(a["id"])
+            arts.append(a)
+    if arts:
+        return arts, False
+
+    # ---- 兜底：官网首页 HTML ----
+    h2 = dict(headers)
+    h2["Accept"] = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
     for site in ("https://www.dongqiudi.com/", "https://m.dongqiudi.com/"):
         try:
-            html = _http_get_text(site, headers)
-            arts = parse_homepage(html)
-            if arts:
-                return arts[:40], False
+            home = parse_homepage(_http_get_text(site, h2))
+            if home:
+                return home, False
         except Exception:  # noqa: BLE001
             continue
     return SAMPLE_NEWS, True
@@ -340,7 +403,12 @@ def fmt_time(raw):
 
 
 # ------------------------- 纯函数：数据处理（可单测） ------------------------
+# v2 评论没有表情字段，改从正文里提取 emoji（覆盖两个常用码段）
+EMOJI_RE = re.compile("[\U0001F300-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE0F]")
+
+
 def aggregate_emoji(comments):
+    """表情统计：兼容旧接口的 emoji_stats，同时从评论正文里提取 emoji。"""
     agg = {}
     for c in comments:
         stats = c.get("emoji_stats") or []
@@ -348,6 +416,18 @@ def aggregate_emoji(comments):
             for e in stats:
                 if isinstance(e, dict) and e.get("key"):
                     agg[e["key"]] = agg.get(e["key"], 0) + int(e.get("count", 0) or 0)
+        for ch in EMOJI_RE.findall(c.get("content") or ""):
+            agg[ch] = agg.get(ch, 0) + 1
+    return agg
+
+
+def aggregate_location(comments):
+    """评论地区分布（v2 接口提供 iptext 字段）。"""
+    agg = {}
+    for c in comments:
+        loc = (c.get("location") or "").strip()
+        if loc:
+            agg[loc] = agg.get(loc, 0) + 1
     return agg
 
 
@@ -483,9 +563,10 @@ def build_rows(comments):
             "点赞": c.get("like_count") if c.get("like_count") is not None else 0,
             "回复数": c.get("sub_comment_count") if c.get("sub_comment_count") is not None else 0,
             "时间": c.get("created_at", ""),
-            "表情表态": emoji_str,
+            "地区": c.get("location") or "",
             "情感": classify(s),
             "情感分": round(s, 2),
+            "表情表态": emoji_str,
         })
     return rows
 
@@ -497,7 +578,8 @@ def fetch_or_sample(article_id):
     避免给「没评论的文章」塞假数据。
     """
     try:
-        r = dqd.crawl_article(article_id, max_pages=50)
+        # max_pages=120：v2 每页 20 条 → 最多约 2400 条评论，足够覆盖绝大多数文章
+        r = dqd.crawl_article(article_id, max_pages=120)
     except Exception as e:  # noqa: BLE001
         r = {"article_id": article_id, "source": "failed", "total": 0, "comments": [],
              "error": str(e), "reasons": [str(e)]}
@@ -600,7 +682,9 @@ def render_hot(comments, topn=8):
     html = ""
     for _, r in hot.iterrows():
         meta = (f"👤 {esc(r['用户名'])}　👍 {r['点赞']}　💬 {r['回复数']}　"
-                f"🕒 {esc(r['时间'])}　💡 {esc(r['情感'])}")
+                f"🕒 {esc(r['时间'])}　💡 {esc(r['情感'])}（{r['情感分']}）")
+        if r.get("地区"):
+            meta += f"　📍 {esc(r['地区'])}"
         if r["表情表态"]:
             meta += f"　{esc(r['表情表态'])}"
         html += f"""
@@ -621,6 +705,10 @@ def main():
         if key not in st.session_state:
             st.session_state[key] = (None if key in ("news", "selected") else
                                      ("" if key == "sel_title" else {}))
+    if "page" not in st.session_state:
+        st.session_state.page = 1
+    if "last_query" not in st.session_state:
+        st.session_state.last_query = ""
 
     # 支持 ?sel=<文章ID> 直接打开某篇的分析（可分享链接）
     _qp_sel = st.query_params.get("sel")
@@ -642,6 +730,7 @@ def main():
                 st.session_state.news = fetch_news_list()
                 st.session_state.selected = None
                 st.session_state.results = {}
+                st.session_state.page = 1
                 st.rerun()
     news, is_demo_news = st.session_state.news
     with c_status:
@@ -650,28 +739,75 @@ def main():
         else:
             st.success(f"✅ 已加载 {len(news)} 条懂球帝实时新闻，点选卡片即可爬取评论。", icon="✅")
 
-    # ---- 新闻网格（3 列卡片） ----
+    # ---- 新闻区：搜索 + 每页条数 ----
     st.markdown('<div class="dqd-section-title">📰 实时新闻 · 点选一篇爬取评论</div>',
                 unsafe_allow_html=True)
-    cols = st.columns(3, gap="medium")
-    for i, art in enumerate(news):
-        with cols[i % 3]:
-            with st.container(border=True, key=f"card_{art['id']}"):
-                if art.get("cover"):
-                    try:
-                        st.image(art["cover"], width="stretch")
-                    except Exception:  # noqa: BLE001
+    c_q, c_page = st.columns([3, 1], gap="medium")
+    with c_q:
+        q = st.text_input("搜索新闻", key="news_query", label_visibility="collapsed",
+                          placeholder="🔍 搜索新闻标题（如：亚冠 / 曼城 / 申花）")
+    with c_page:
+        per_page = st.selectbox("每页条数", [9, 12, 18, 24], index=1,
+                                key="per_page", label_visibility="collapsed")
+
+    # 关键词变化 → 回到第 1 页
+    if st.session_state.last_query != q:
+        st.session_state.last_query = q
+        st.session_state.page = 1
+
+    qn = (q or "").strip().lower()
+    filtered = [a for a in news
+                if (not qn)
+                or qn in a["title"].lower()
+                or qn in str(a.get("tag") or "").lower()]
+    total_pages = max(1, (len(filtered) + per_page - 1) // per_page)
+    page = min(max(1, int(st.session_state.page)), total_pages)
+    st.session_state.page = page
+    page_items = filtered[(page - 1) * per_page: page * per_page]
+
+    # ---- 新闻网格（3 列卡片，按当前页渲染）----
+    if not filtered:
+        st.markdown(f'<div class="dqd-hint">没有匹配「{esc(q)}」的新闻，换个关键词试试。</div>',
+                    unsafe_allow_html=True)
+    else:
+        cols = st.columns(3, gap="medium")
+        for i, art in enumerate(page_items):
+            with cols[i % 3]:
+                with st.container(border=True, key=f"card_{art['id']}"):
+                    if art.get("cover"):
+                        try:
+                            st.image(art["cover"], width="stretch")
+                        except Exception:  # noqa: BLE001
+                            st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
+                    else:
                         st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
-                else:
-                    st.markdown(PLACEHOLDER_COVER, unsafe_allow_html=True)
-                st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>',
-                            unsafe_allow_html=True)
-                meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
-                st.markdown(f'<div class="dqd-meta">{esc(meta or "懂球帝")}</div>',
-                            unsafe_allow_html=True)
-                if st.button("📥 爬取评论", key=f"btn_{art['id']}", width="stretch"):
-                    st.session_state.selected = art["id"]
-                    st.session_state.sel_title = art["title"]
+                    st.markdown(f'<div class="dqd-title">{esc(art["title"])}</div>',
+                                unsafe_allow_html=True)
+                    meta = " · ".join([x for x in [art.get("tag"), art.get("time")] if x])
+                    if art.get("comments") is not None:
+                        meta += f"　💬 {art['comments']}"
+                    st.markdown(f'<div class="dqd-meta">{esc(meta or "懂球帝")}</div>',
+                                unsafe_allow_html=True)
+                    if st.button("📥 爬取评论", key=f"btn_{art['id']}", width="stretch"):
+                        st.session_state.selected = art["id"]
+                        st.session_state.sel_title = art["title"]
+
+        # ---- 分页控件 ----
+        pg1, pg2, pg3 = st.columns([1, 3, 1], gap="medium")
+        with pg1:
+            if st.button("‹ 上一页", key="pg_prev", width="stretch", disabled=(page <= 1)):
+                st.session_state.page = page - 1
+                st.rerun()
+        with pg2:
+            info = f"第 {page} / {total_pages} 页　·　共 {len(filtered)} 条"
+            if qn:
+                info += f"　·　关键词「{esc(q)}」"
+            st.markdown(f'<div class="dqd-pageinfo">{info}</div>', unsafe_allow_html=True)
+        with pg3:
+            if st.button("下一页 ›", key="pg_next", width="stretch",
+                         disabled=(page >= total_pages)):
+                st.session_state.page = page + 1
+                st.rerun()
 
     # ---- 未选择新闻时的引导 ----
     sel = st.session_state.selected
@@ -685,7 +821,7 @@ def main():
                 unsafe_allow_html=True)
 
     if sel not in st.session_state.results:
-        with st.spinner("正在爬取评论（文章页 → 网页接口 → App 接口）…"):
+        with st.spinner("正在爬取评论（App 接口全量翻页 → 网页首屏兜底）…"):
             res, demo = fetch_or_sample(sel)
             st.session_state.results[sel] = (res, demo)
     res, demo = st.session_state.results[sel]
@@ -733,7 +869,8 @@ def main():
 
     with a2:
         with st.container(border=True, key="panel_sent"):
-            st.markdown(render_h("💡 情感分析"), unsafe_allow_html=True)
+            st.markdown(render_h(f"💡 情感分析 · 全部 {len(comments)} 条评论逐条赋分"),
+                        unsafe_allow_html=True)
             scored = [sentiment_score(c.get("content", "")) for c in comments]
             if scored:
                 avg = sum(scored) / len(scored)
@@ -765,30 +902,48 @@ def main():
             else:
                 st.caption("没有可供分析的评论文本。")
 
-    # ---- 第二行：表情 Top10 ｜ 热门评论 ----
-    agg = aggregate_emoji(comments)
+    # ---- 第二行：表情 / 地区 ｜ 热门评论 ----
+    emoji_agg = aggregate_emoji(comments)
+    loc_agg = aggregate_location(comments)
+    # 优先地区分布（v2 主源提供、数据更密）；没有地区才退回表情；都没有给说明
+    if loc_agg:
+        side_title, side_html = "🌍 评论来源地区 Top 10", render_emoji_bars(loc_agg, 10)
+    elif emoji_agg:
+        side_title, side_html = "🔥 表情 / 表态 Top 10", render_emoji_bars(emoji_agg, 10)
+    else:
+        side_title = "🌍 评论来源地区"
+        side_html = '<div class="dqd-note">该数据来源暂无地区 / 表情统计数据</div>'
+
     b1, b2 = st.columns(2, gap="large")
     with b1:
-        with st.container(border=True, key="panel_emoji"):
-            st.markdown(render_h("🔥 表情 / 表态 Top 10"), unsafe_allow_html=True)
-            st.markdown(render_emoji_bars(agg, 10), unsafe_allow_html=True)
+        with st.container(border=True, key="panel_side"):
+            st.markdown(render_h(side_title), unsafe_allow_html=True)
+            st.markdown(side_html, unsafe_allow_html=True)
     with b2:
         with st.container(border=True, key="panel_hot"):
             st.markdown(render_h("💬 热门评论 · 按点赞排序"), unsafe_allow_html=True)
             st.markdown(render_hot(comments, 6), unsafe_allow_html=True)
 
-    # ---- 第三行：全部评论（整行） ----
+    # ---- 第三行：全部评论（整行）----
     with st.container(border=True, key="panel_all"):
-        st.markdown(render_h("📋 全部评论"), unsafe_allow_html=True)
+        reported = res.get("reported_total")
+        all_note = f"共抓取 {total} 条评论"
+        if reported and reported > total:
+            all_note += f"（接口自报总数 {reported}，含二级回复）"
+        st.markdown(render_h(f"📋 全部评论 · {all_note}"), unsafe_allow_html=True)
         rows = build_rows(comments)
         df = pd.DataFrame(rows)
         if df.empty:
             st.caption("暂无评论数据。")
         else:
-            max_items = st.slider("列表展示条数", 10, 300, 60, key="maxitems")
-            st.dataframe(df.head(max_items), width="stretch", height=420)
+            n = len(df)
+            if n > 60:
+                max_items = st.slider("列表展示条数", 60, n, n, step=20, key="maxitems")
+            else:
+                max_items = n
+            st.dataframe(df.head(max_items), width="stretch", height=460)
             st.download_button(
-                "⬇️ 下载 CSV",
+                f"⬇️ 下载全部 {n} 条评论（CSV）",
                 df.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"dongqiudi_{res['article_id']}.csv",
                 mime="text/csv",
@@ -885,6 +1040,10 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
   border-left:5px solid var(--dqd-red);border-radius:12px;box-shadow:var(--shadow);}
 .dqd-hint{margin:18px 0;padding:16px 20px;background:var(--card);
   border:1px dashed #d8dbe0;border-radius:12px;color:var(--muted);font-size:14px;}
+/* 分页信息条 */
+.dqd-pageinfo{margin:0;padding:11px 14px;text-align:center;font-size:13px;
+  font-weight:700;color:var(--ink);background:var(--card);border:1px solid var(--line);
+  border-radius:12px;box-shadow:var(--shadow);}
 
 /* ---------- 热门评论 ---------- */
 .dqd-hot{background:var(--soft);border:1px solid var(--line);border-left:4px solid var(--dqd-red);
@@ -905,6 +1064,8 @@ html,body,[data-testid="stAppViewContainer"]{background:var(--bg)!important;}
   border:1px solid var(--dqd-red)!important;color:var(--dqd-red)!important;
   background:#fff!important;transition:background .15s ease;}
 .stButton>button:hover{background:#fef2f2!important;}
+.stButton>button:disabled{border-color:var(--line)!important;color:#b6bcc4!important;
+  background:#f7f8fa!important;}
 .stButton>button[kind="primary"]{
   background:linear-gradient(120deg,var(--dqd-red),var(--dqd-red2))!important;
   color:#fff!important;border:none!important;}
